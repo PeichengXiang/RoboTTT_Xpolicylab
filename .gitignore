@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+runs/
+checkpoints/
+results.json
+*.pt
+*.pth
+*.hdf5
+*.npz
+*.log

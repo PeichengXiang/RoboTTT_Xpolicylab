@@ -1,0 +1,32 @@
+# 论文对照与复现假设
+
+依据 Jiang et al. 的 [RoboTTT: Context Scaling for Robot Policies（v1）](https://arxiv.org/abs/2607.15275v1)，重点对应 §2、§3.1–3.4、Fig. 2–4、Appendix A/B。论文的实验视频位于 [NVIDIA GEAR 项目页](https://research.nvidia.com/labs/gear/robottt/)。截至 2026-11-23，在该项目页和论文中未找到官方 RoboTTT 源码、快权重检查点或论文实验所用的数据包。公开的 [GR00T N1.7](https://github.com/NVIDIA/Isaac-GR00T/tree/708617f5716c63fc0a327391492ea2b91977ae90) 是可接入的基础模型。
+
+## 按论文实现的机制
+
+| 原文位置 | 实现 |
+| --- | --- |
+| §2，Eq. 1–2 | 从当前 token 投影出 Q、K、V，用 K→V 的均方误差对双层 GELU MLP 做内循环梯度下降，再用更新过的快权重查询 Q。初始化、投影和内循环学习率可通过外循环反传；每条轨迹有独立的快权重状态。 |
+| §3.1，Fig. 2–3 | 当前观测内做 self/cross-attention，16 个 register token、proprio token 和加噪动作 token 进入 TTT。视觉语言 token 只用于 cross-attention。每层对 TTT 输出乘以逐通道 `tanh(α)` 后加回，`α=0.001`。 |
+| §3.2，Eq. 4–5 | 每个动作块独立抽取 `τ = 0.999 × (1 - u)`，`u ~ Beta(1.5,1)`，插值 `Aτ = τA + (1-τ)ε`，预测 `A−ε`。TBPTT 每段反传，段间保留快权重数值并截断梯度，每批累积后更新外循环参数。 |
+| §3.3 | 有效上下文可以更新快权重，同时屏蔽对应动作损失。视频条件数据需要把同任务的视频和机器人轨迹拼接；DAgger 可以用 `loss_mask` 把监督限制在人类接管动作上。 |
+| Appendix A.1 | 快模型为双层 GELU MLP，内循环基础学习率 0.1，可学习调节，RoPE 基数 10000。接入时改造传入动作头的每一个 DiT block。论文是 16 层。 |
+
+## 原文未确定的细节
+
+| 细节 | 本项目处理及影响 |
+| --- | --- |
+| 内循环头数、隐藏扩展、Q/K/V 归一化、学习率参数化、RoPE 位置粒度 | 公开 GR00T 接入默认 32 个 TTT 头，MLP 隐藏层扩展 4 倍，无额外 Q/K/V 归一化，步长为 `2 × 0.1 × sigmoid(每头参数)`，参数初始为零。Q/K 按展开后的绝对 token 位置做 RoPE。公开头宽 1536 时每层 TTT 约 10.04M 参数。详见 `robottt/ttt.py`。 |
+| TTT 的 mini-batch 和更新顺序 | Fig. 2 指明推理每次消费一个 mini-batch。本项目每个策略调用的 token 组共享一次 MSE 梯度更新，组内并行后读取，组间按时间因果推进。快权重和 RoPE 的索引以策略调用推进。 |
+| 预测 horizon H、执行 stride、长上下文计数 | §3.1 与 Fig. 2 描述了动作块和 `t+H`，未明确各实验的 H、是否重叠或对 raw 30 Hz 样本如何分组。NPZ 默认完整的非重叠 H 个动作配一个观测。压力测试的 8192 指 8192 次上下文更新。 |
+| Flow 子步与快权重提交 | §3.2 只说明 k 步去噪并跨观测传递快权重。本项目每次 Euler 子步都从同一个传入状态做临时 update→apply，只提交最后一次子步的状态。小模型默认 4 步，公开 N1.7 也默认 4 步。 |
+| 视频无状态/动作和部署时动作回填 | 小模型缺省用零作为视频前缀的 proprio/action 占位，仍按 Eq. 5 加噪。已知的执行动作可以交给 `observe`。论文未给出人视频的相机配对、token 填充、动作对齐、接管边界切 chunk 的规则。 |
+| TBPTT 段长和训练课程细节 | 段长可配置。本地默认 16 个策略步。论文给出了上下文上限、预训练增长方向和优化器峰值，未给出切段长度、课程里程碑、WSD 各阶段步数、数据混合采样权重。 |
+| 基础权重与数据版本 | Appendix A.1 指定的是 Eagle VLM 的 GR00T N1.7。公开 N1.7 使用 Cosmos-Reason2-2B/Qwen3-VL；公开源码里的默认配置是 16 层，但 [公开权重的配置文件](https://huggingface.co/nvidia/GR00T-N1.7-3B/blob/main/config.json) 覆盖为 32 层、40 动作 horizon。未找到论文所用确切 checkpoint、双臂数据与 EgoScale 的混合清单、YAM 下游轨迹、配对 Circuit 人视频和 DAgger 轨迹。公开 checkpoint 和其依赖见 [NVIDIA GR00T 文档](https://github.com/NVIDIA/Isaac-GR00T/blob/708617f5716c63fc0a327391492ea2b91977ae90/README.md#gr00t-n17)。 |
+| 数值和评估 | 论文没有公布快权重计算精度、数值稳定化实现、或每次试验的初始摆放及训练随机种子。低精度输入的内循环使用 FP32 快权重与梯度运算。本地数据和任务用于检验方法路径，论文的 YAM 装配成功率、扰动恢复、DAgger 增益和闭环上下文缩放曲线均待原实验资源。 |
+
+## 原文实验规模
+
+- 预训练 30K 步，16 张 GB200，冻结基础 GR00T，仅训练新增序列层。最大上下文 ≤4K 时每卡 batch 4，>4K 时每卡 batch 1。AdamW weight decay `1e-5`，WSD 峰值 `2e-5`。
+- 下游 20K 步，8 张 GB200，每卡 batch 1，上下文 1K，全参数微调。AdamW weight decay `1e-5`，cosine 峰值 `5e-5`。
+- 论文使用 YAM 双臂、四路 RealSense D405 480p RGB、RTX 5090 和 30 Hz 控制。台架任务为 Pup Go Car、Circuit 和 Gear Bot。主表中的完全成功次数分别为 9/20、13/20、2/10。Fig. 8 的 8K 预训练上下文评测是单独的实验。

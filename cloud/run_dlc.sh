@@ -11,7 +11,7 @@ case "$mode" in
 Usage: bash cloud/run_dlc.sh [check|train]
 check: validate all six sets of 50 HDF5 demonstrations, e.g. from CPU DSW.
 train: train one DLC worker on 4 A100 or 4 A800 GPUs, global batch size 64,
-       50,000 optimizer steps (including any steps in a resumed checkpoint).
+       50,000 optimizer steps (including resumed steps), saving every 10,000 steps.
 
 ROBOTTT_NAS_ROOT    NAS mount point, default /mnt/workspace.
 ROBOTTT_DATA_ROOT   HDF5 root, default ROBOTTT_NAS_ROOT/raw.
@@ -88,4 +88,4 @@ if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
 fi
 exec "$python" -m torch.distributed.run --standalone --nproc-per-node=4 -m robottt.ddp_train \
     --data "$data_root" --cache "$cache_dir" --output "$run_dir" \
-    --steps 50000 --global-batch 64 --micro-batch "$micro_batch" --val-per-task 0 --require-a100-a800 "${resume[@]}"
+    --steps 50000 --global-batch 64 --micro-batch "$micro_batch" --val-per-task 0 --save-every 10000 --keep-every 10000 --require-a100-a800 "${resume[@]}"

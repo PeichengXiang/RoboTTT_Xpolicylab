@@ -25,6 +25,10 @@
 | 基础权重与数据版本 | Appendix A.1 指定的是 Eagle VLM 的 GR00T N1.7。公开 N1.7 使用 Cosmos-Reason2-2B/Qwen3-VL；公开源码里的默认配置是 16 层，但 [公开权重的配置文件](https://huggingface.co/nvidia/GR00T-N1.7-3B/blob/main/config.json) 覆盖为 32 层、40 动作 horizon。未找到论文所用确切 checkpoint、双臂数据与 EgoScale 的混合清单、YAM 下游轨迹、配对 Circuit 人视频和 DAgger 轨迹。公开 checkpoint 和其依赖见 [NVIDIA GR00T 文档](https://github.com/NVIDIA/Isaac-GR00T/blob/708617f5716c63fc0a327391492ea2b91977ae90/README.md#gr00t-n17)。 |
 | 数值和评估 | 论文没有公布快权重计算精度、数值稳定化实现、或每次试验的初始摆放及训练随机种子。低精度输入的内循环使用 FP32 快权重与梯度运算。本地数据和任务用于检验方法路径，论文的 YAM 装配成功率、扰动恢复、DAgger 增益和闭环上下文缩放曲线均待原实验资源。 |
 
+## 六任务训练的数值保护
+
+天机六任务的分布式训练另启用快权重数值保护。每个头的 K 向量 L2 范数上限为 1，Q 和 V 的 RMS 上限为 1。每次内循环梯度下降后，各快权重张量按输出宽度限制 Frobenius 范数。小模型和 GR00T 适配的参考实现默认保留 Eq. 1 的直接更新。
+
 ## 原文实验规模
 
 - 预训练 30K 步，16 张 GB200，冻结基础 GR00T，仅训练新增序列层。最大上下文 ≤4K 时每卡 batch 4，>4K 时每卡 batch 1。AdamW weight decay `1e-5`，WSD 峰值 `2e-5`。

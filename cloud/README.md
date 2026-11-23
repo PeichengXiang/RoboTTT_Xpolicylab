@@ -38,4 +38,6 @@ bash cloud/run_dlc.sh train
 
 DLC 日志的 `configuration` 会打印模型和 batch 参数，`train` 带 optimizer step、loss 和吞吐，`checkpoint` 记录 NAS 保存路径。完成后可从输出目录取 `step_050000.pt` 评测。
 
+六任务训练对内循环启用 Q/K/V 范数约束及快权重投影，内循环仍在 FP32 中计算。外层 AdamW 峰值学习率为 `1e-4`。第一次未加约束的四卡训练在约 1,250 步后出现非有限梯度。现在探测到异常时会记录失败步及受影响的参数，退出供检查和恢复。
+
 [阿里云 DLC 任务创建与资源配置](https://help.aliyun.com/zh/pai/create-a-training-task)

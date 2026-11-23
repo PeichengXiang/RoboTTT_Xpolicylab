@@ -27,7 +27,7 @@ class TTTMLP(nn.Module):
     (2 × base × sigmoid), and RoPE on Q/K at absolute flattened token positions.
     """
 
-    def __init__(self, width, heads=4, expansion=4, base_lr=0.1, rope_theta=10_000):
+    def __init__(self, width, heads=4, expansion=4, base_lr=0.1, rope_theta=10_000, *, stabilize=False):
         super().__init__()
         if min(width, heads, expansion, base_lr, rope_theta) <= 0 or width % (heads * 2):
             raise ValueError("Expected positive dimensions, rates and even head width")
@@ -35,6 +35,7 @@ class TTTMLP(nn.Module):
         self.head_dim = width // heads
         self.base_lr = base_lr
         self.rope_theta = rope_theta
+        self.stabilize = stabilize
         head_width = self.head_dim
         hidden_width = head_width * expansion
         self.qkv = nn.Linear(width, 3 * width)
@@ -47,10 +48,11 @@ class TTTMLP(nn.Module):
 
     def initialize(self, batch_size):
         dtype = torch.float64 if self.w1.dtype == torch.float64 else torch.float32
-        return FastWeights(*(
+        initial = FastWeights(*(
             parameter.to(dtype).expand(batch_size, *parameter.shape)
             for parameter in (self.w1, self.b1, self.w2, self.b2)
         ))
+        return self._bound_fast_weights(initial) if self.stabilize else initial
 
     def forward(self, tokens, state=None, *, update=True, valid=None, start_step=0):
         """Accept [B,T,L,D] or a single [B,L,D] chunk and optional validity mask."""
@@ -78,6 +80,12 @@ class TTTMLP(nn.Module):
         query, key, value = projected.reshape(
             batch, steps, count, 3, self.heads, self.head_dim
         ).permute(3, 1, 0, 4, 2, 5).unbind(0)
+        if self.stabilize:
+            # Unit keys limit the curvature of the inner objective. Query and
+            # target vectors keep their original scale up to RMS 1 per head.
+            query = self._limit_norm(query, sqrt(self.head_dim), -1)
+            key = self._limit_norm(key, 1.0, -1)
+            value = self._limit_norm(value, sqrt(self.head_dim), -1)
         rates = self.rope_theta ** (
             -torch.arange(0, self.head_dim, 2, device=projected.device, dtype=projected.dtype) / self.head_dim
         )
@@ -92,8 +100,22 @@ class TTTMLP(nn.Module):
         for query_t, key_t, value_t, mask in zip(query, key, value, valid.transpose(0, 1), strict=True):
             if update:
                 state = self._update(state, key_t, value_t, mask, rate)
+                if self.stabilize:
+                    state = self._bound_fast_weights(state)
             outputs.append(F.gelu(query_t @ state.w1 + state.b1) @ state.w2 + state.b2)
         return torch.stack(outputs, dim=1), state
+
+    @staticmethod
+    def _limit_norm(value, maximum, dimensions):
+        norm = torch.linalg.vector_norm(value, dim=dimensions, keepdim=True)
+        return value * (maximum / norm.clamp_min(maximum))
+
+    @classmethod
+    def _bound_fast_weights(cls, state):
+        return FastWeights(*(
+            cls._limit_norm(value, 2.0 * sqrt(value.shape[-1]), (-2, -1))
+            for value in (state.w1, state.b1, state.w2, state.b2)
+        ))
 
     @staticmethod
     def _rotate(value, cosine, sine):

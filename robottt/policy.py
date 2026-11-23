@@ -19,6 +19,7 @@ class PolicyConfig:
     registers: int = 16
     gate_init: float = 0.001
     use_ttt: bool = True
+    stabilize_fast_weights: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class StepBlock(nn.Module):
         if config.use_ttt:
             from .ttt import TTTMLP
 
-            self.ttt = TTTMLP(width, heads=config.heads)
+            self.ttt = TTTMLP(width, heads=config.heads, stabilize=config.stabilize_fast_weights)
             self.gate = nn.Parameter(torch.full((width,), config.gate_init))
 
     def forward(self, tokens, context, valid, fast, index):

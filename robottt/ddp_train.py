@@ -177,6 +177,7 @@ def _train(args, rank, world, device, episodes, train, validation):
     config = PolicyConfig(
         spec.obs_dim, spec.state_dim, spec.action_dim, horizon=args.horizon,
         width=args.width, layers=args.layers, heads=args.heads, use_ttt=not args.no_ttt,
+        stabilize_fast_weights=not args.no_ttt,
     )
     if rank == 0:
         _emit(event="configuration", world_size=world, device=str(device), data_sha256=data_manifest["sha256"],
@@ -228,7 +229,14 @@ def _train(args, rank, world, device, episodes, train, validation):
             group["lr"] = _lr(args, step)
         # Per-step stream is independent of work performed before a restart.
         noise.manual_seed(args.seed + step * world + rank)
-        loss, grad = _step(model, optimizer, source, accumulated, device, dtype, args.segment, noise)
+        try:
+            loss, grad = _step(model, optimizer, source, accumulated, device, dtype, args.segment, noise)
+        except RuntimeError:
+            if rank == 0:
+                nonfinite = [name for name, parameter in base_model.named_parameters()
+                             if parameter.grad is not None and not torch.isfinite(parameter.grad).all()]
+                _emit(event="optimizer_error", step=step, nonfinite_gradient_parameters=nonfinite[:16])
+            raise
         if step == completed_steps + 1 or step % args.log_every == 0 or step == args.steps:
             if world > 1:
                 dist.reduce(loss, dst=0)
@@ -283,7 +291,7 @@ def main():
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--workers", type=int, default=0)

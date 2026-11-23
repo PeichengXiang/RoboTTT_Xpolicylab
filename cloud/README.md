@@ -29,7 +29,7 @@ bash cloud/run_dlc.sh train
 
 `ROBOTTT_NAS_ROOT` 可改为 DLC 的实际挂载点，例如 `/mnt/data`。脚本默认从该挂载点下的 `raw` 读取；如原始数据位于其他绝对路径，用 `ROBOTTT_DATA_ROOT`。输出目录须在该 NAS 下。`ROBOTTT_CACHE_DIR` 默认 `/tmp/robottt-rgb-cache`，用于工作容器内的图像特征缓存。
 
-固定全局 batch 64、50,000 次优化器更新。四个数据并行进程使用单卡微批次 4 和 4 次梯度累积。每 500 步更新 `latest.pt`，每 5,000 步保存命名 checkpoint。重启使用同一版本的代码、数据和输出目录，并设置：
+固定全局 batch 64、50,000 次优化器更新。四个数据并行进程默认各处理 16 条序列。可用 ROBOTTT_MICRO_BATCH 调低每卡微批次，启动脚本会保持全局 batch 不变。每 500 步更新 `latest.pt`，每 5,000 步保存命名 checkpoint。重启使用同一版本的代码、数据和输出目录，并设置：
 
 ```bash
 export ROBOTTT_RESUME="$ROBOTTT_RUN_DIR/latest.pt"

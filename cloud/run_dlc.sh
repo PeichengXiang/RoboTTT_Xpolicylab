@@ -18,6 +18,7 @@ ROBOTTT_DATA_ROOT   HDF5 root, default ROBOTTT_NAS_ROOT/raw.
 ROBOTTT_RUN_DIR     Required output directory for train. Use a persistent NAS path.
 ROBOTTT_CACHE_DIR   Worker-local RGB feature cache, default /tmp/robottt-rgb-cache.
 ROBOTTT_PYTHON      Python in the DLC image/venv, default python3.
+ROBOTTT_MICRO_BATCH Sequences per GPU before accumulation, default 16.
 ROBOTTT_RESUME      Optional complete checkpoint file to resume.
 HELP
         exit 0
@@ -53,6 +54,11 @@ if [[ "$nas_root" == / || "$run_dir" != "$nas_root/"* ]]; then
     echo "The output directory must be below the NAS mount: $nas_root" >&2
     exit 2
 fi
+micro_batch="${ROBOTTT_MICRO_BATCH:-16}"
+case "$micro_batch" in
+    1|2|4|8|16) ;;
+    *) echo "ROBOTTT_MICRO_BATCH must divide 16." >&2; exit 2 ;;
+esac
 cache_dir="${ROBOTTT_CACHE_DIR:-/tmp/robottt-rgb-cache}"
 if [[ "$cache_dir" != /* ]]; then
     echo "ROBOTTT_CACHE_DIR must be an absolute worker-local path." >&2
@@ -82,4 +88,4 @@ if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
 fi
 exec "$python" -m torch.distributed.run --standalone --nproc-per-node=4 -m robottt.ddp_train \
     --data "$data_root" --cache "$cache_dir" --output "$run_dir" \
-    --steps 50000 --global-batch 64 --val-per-task 0 --require-a100-a800 "${resume[@]}"
+    --steps 50000 --global-batch 64 --micro-batch "$micro_batch" --val-per-task 0 --require-a100-a800 "${resume[@]}"

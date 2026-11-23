@@ -11,7 +11,7 @@ bash setup_xpolicylab.sh /path/to/XPolicyLab
 ROBOTTT_DATA_ROOT=/path/to/benchmark_data bash cloud/run_dlc.sh check
 ```
 
-[阿里云 DLC 训练入口](cloud/README.md)使用一个节点上的 4 张 A100 或 4 张 A800。有效全局 batch 为 64 条轨迹序列，每卡 micro-batch 4、累积 4 次，总计 50,000 个优化器步。训练读取 NAS 的 `/mnt/workspace/raw`，要求六个任务各有 50 条 HDF5 示范。官方测试种子独立于这 300 条训练轨迹。
+[阿里云 DLC 训练入口](cloud/README.md)使用一个节点上的 4 张 A100 或 4 张 A800。有效全局 batch 为 64 条轨迹序列，默认每卡 micro-batch 16，总计 50,000 个优化器步。训练读取 NAS 的 `/mnt/workspace/raw`，要求六个任务各有 50 条 HDF5 示范。官方测试种子独立于这 300 条训练轨迹。
 
 这次训练使用本项目的小型 RoboTTT 动作头，保留 TTT-MLP、序列 flow matching 与 TBPTT。三相机图像用 RGB patch token，训练中逐步将上下文上限从 32 增至 192 个策略调用，每次预测 8 个 30 Hz 动作。任务文本用六个固定任务 ID 编码。论文中的 Eagle/GR00T 初始化与预训练数据仍不可用。
 

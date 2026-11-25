@@ -63,22 +63,30 @@ def marvin_statistics(train: Sequence[Episode]):
 
 def read_marvin_step(episode: Episode, index: int, horizon: int):
     """Return the stored RGBs, original instruction and an aligned action chunk."""
+    return next(read_marvin_steps(episode, (index,), horizon))
+
+
+def read_marvin_steps(episode: Episode, indices: Sequence[int], horizon: int):
+    """Read multiple control steps while reusing the open HDF5 file."""
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.data.types import VLAStepData
     import h5py
 
-    if horizon < 1 or index < 0 or index + horizon > episode.frames:
-        raise ValueError(f"Incomplete action chunk for {episode.path} at {index=} with {horizon=}")
     with h5py.File(episode.path, "r") as file:
         instruction = file.attrs["instruction"]
         if isinstance(instruction, bytes):
             instruction = instruction.decode("utf-8")
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError(f"Missing instruction text in {episode.path}")
-        return VLAStepData(
-            images={camera: [file[f"observations/images/{camera}"][index]] for camera in CAMERAS},
-            states={JOINT_KEY: np.asarray(file["observations/qpos"][index:index + 1], dtype=np.float32)},
-            actions={JOINT_KEY: np.asarray(file["action"][index:index + horizon], dtype=np.float32)},
-            text=instruction,
-            embodiment=EmbodimentTag.NEW_EMBODIMENT,
-        )
+        images = {camera: file[f"observations/images/{camera}"] for camera in CAMERAS}
+        states, actions = file["observations/qpos"], file["action"]
+        for index in indices:
+            if horizon < 1 or index < 0 or index + horizon > episode.frames:
+                raise ValueError(f"Incomplete action chunk for {episode.path} at {index=} with {horizon=}")
+            yield VLAStepData(
+                images={camera: [frames[index]] for camera, frames in images.items()},
+                states={JOINT_KEY: np.asarray(states[index:index + 1], dtype=np.float32)},
+                actions={JOINT_KEY: np.asarray(actions[index:index + horizon], dtype=np.float32)},
+                text=instruction,
+                embodiment=EmbodimentTag.NEW_EMBODIMENT,
+            )

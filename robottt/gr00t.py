@@ -82,33 +82,46 @@ class Gr00tRoboTTT(nn.Module):
         self, action_head: nn.Module, *, registers: int = 16, ttt_heads: int = 32,
         gate_init: float = 0.001, embodiment_id: int | None = None,
         stabilize_fast_weights: bool = False,
+        ttt_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         if registers < 0 or ttt_heads < 1:
             raise ValueError("registers must be nonnegative and ttt_heads must be positive")
         self.head = action_head
         self.default_embodiment_id = embodiment_id
+        self.stabilize_fast_weights = stabilize_fast_weights
         width = action_head.model.inner_dim
         if width % (ttt_heads * 2):
             raise ValueError("DiT width must be divisible by twice the TTT head count")
         weight = next(action_head.parameters())
-        self.registers = nn.Parameter(weight.new_empty((registers, action_head.input_embedding_dim)))
+        adapter_dtype = weight.dtype if ttt_dtype is None else ttt_dtype
+        self.registers = nn.Parameter(torch.empty(
+            registers, action_head.input_embedding_dim, device=weight.device, dtype=adapter_dtype,
+        ))
         nn.init.normal_(self.registers, std=0.02)
         self.memories = nn.ModuleList(
             TTTMLP(width, heads=ttt_heads, stabilize=stabilize_fast_weights).to(
-                device=weight.device, dtype=weight.dtype,
+                device=weight.device, dtype=adapter_dtype,
             )
             for _ in action_head.model.transformer_blocks
         )
-        self.gates = nn.Parameter(weight.new_full((len(self.memories), width), gate_init))
+        self.gates = nn.Parameter(torch.full(
+            (len(self.memories), width), gate_init, device=weight.device, dtype=adapter_dtype,
+        ))
         self.set_stage("pretrain")
 
     @classmethod
-    def from_local_checkpoint(cls, checkpoint: str | Path, **kwargs):
+    def from_local_checkpoint(
+        cls, checkpoint: str | Path, *, device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None, **kwargs,
+    ):
         """Load action-head weights from an official local N1.7 safetensors snapshot.
 
         Install Isaac-GR00T first. No VLM is instantiated, so this can use previously
         extracted compatible embeddings without external model credentials.
+        Set `dtype=torch.bfloat16, ttt_dtype=torch.float32` for a BF16 base and
+        FP32 adapter parameters. Move the assembled model by device only to
+        preserve that split.
         """
         from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
         from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
@@ -116,6 +129,7 @@ class Gr00tRoboTTT(nn.Module):
         checkpoint = Path(checkpoint)
         head = Gr00tN1d7ActionHead(Gr00tN1d7Config.from_pretrained(checkpoint, local_files_only=True))
         head.load_state_dict(_checkpoint_tensors(checkpoint, "action_head."), strict=True)
+        head.to(device=device, dtype=dtype)
         return cls(head, **kwargs)
 
     def set_stage(self, stage: str):
@@ -254,7 +268,8 @@ class Gr00tRoboTTT(nn.Module):
             sequence = after_attention.unflatten(0, (batch, steps))
             recalled, updated = memory(sequence, fast, valid=memory_valid, start_step=state.index)
             fast_states.append(updated)
-            tokens = after_attention + recalled.flatten(0, 1).to(after_attention.dtype) * gate.tanh()
+            gate = gate.tanh().to(after_attention.dtype)
+            tokens = after_attention + recalled.flatten(0, 1).to(after_attention.dtype) * gate
             tokens = tokens + block.ff(block.norm3(tokens))
             if hidden_mask is not None:
                 tokens = tokens * hidden_mask.unsqueeze(-1)

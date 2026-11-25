@@ -68,7 +68,11 @@ class TTTMLP(nn.Module):
             valid = torch.ones(batch, steps, count, dtype=torch.bool, device=tokens.device)
         elif valid.ndim == 2:
             valid = valid.unsqueeze(-1).expand(-1, -1, count)
-        projected = self.qkv(tokens.masked_fill(~valid.unsqueeze(-1), 0))
+        # Match the projection parameters when the surrounding native head and
+        # the TTT adapter use different storage dtypes. Outer AMP still controls
+        # projection arithmetic, and the recurrence below uses the carry dtype.
+        tokens = tokens.to(dtype=self.qkv.weight.dtype).masked_fill(~valid.unsqueeze(-1), 0)
+        projected = self.qkv(tokens)
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             memory, state = self._recur(projected.to(state.w1.dtype), state, valid, update, start_step)
         restored = memory.transpose(2, 3).reshape(batch, steps, count, width)

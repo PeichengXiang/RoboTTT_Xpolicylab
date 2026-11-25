@@ -17,3 +17,9 @@ denoise_steps: 4
 device: null
 cpu_threads: 2
 reset_memory_each_chunk: false
+backend: compact
+gr00t_base: null
+gr00t_processor: null
+gr00t_statistics: null
+allow_untrained_ttt: false
+execution_horizon: null

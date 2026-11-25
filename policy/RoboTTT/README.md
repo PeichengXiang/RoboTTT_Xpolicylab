@@ -52,3 +52,26 @@ cd /path/to/insert_benchmark
 ```
 
 Set `reset_memory_each_chunk: true` in `deploy.yml` for the same-checkpoint history ablation. Evaluation uses the full returned chunk, matching the policy's non-overlapping chunk training. Plain RGB and encoded RGB debug paths use the upstream server's color decoder. `deploy.py` and `eval.sh` are based on the upstream XPolicyLab demo adapter and covered by [the XPolicyLab license](XPolicyLab-LICENSE).
+
+## Native GR00T N1.7 backbone
+
+Select `backend: gr00t_n1_7` in `deploy.yml` or set `ROBOTTT_BACKEND=gr00t_n1_7`. Use an environment with the [official Isaac-GR00T N1.7 dependencies](https://github.com/NVIDIA/Isaac-GR00T/tree/708617f5716c63fc0a327391492ea2b91977ae90). The official base snapshot and a local Cosmos-compatible processor directory are required. For the public snapshot, the VLM is Cosmos-Reason2-2B and the action head has 32 DiT blocks. The adapter keeps the official VLM and action head and adds the 32 RoboTTT memories. It forwards the three RGB cameras and the benchmark's original language instruction through the native processor. Native `decode_action` restores the 16 absolute joint and gripper commands from normalized model output.
+
+For a trained native checkpoint:
+
+```bash
+export ROBOTTT_BACKEND=gr00t_n1_7
+export ROBOTTT_GR00T_BASE=/absolute/path/to/nvidia-gr00t-n1.7
+export ROBOTTT_GR00T_PROCESSOR=/absolute/path/to/cosmos-compatible-processor
+export INSERT_BENCHMARK_ROOT=/absolute/path/to/insert_benchmark
+
+EVAL_ENV_TYPE=debug DEBUG_OBS_ENCODED=1 DEBUG_EVAL_EPISODES=1 bash eval.sh \
+  InsertBenchmark recover_three /absolute/path/to/native-run/latest.pt \
+  marvin_dual_gripper joint 0 0 0 /path/to/python-env /path/to/python-env
+```
+
+A trained `latest.pt` must declare `backend: gr00t_n1_7`, a positive optimizer `step`, `adapter_config`, `adapter` tensors, and the training-time `marvin_statistics`. The adapter can load TTT-only updates or TTT plus the native Marvin state encoder, action encoder, and action decoder when the checkpoint declares `tune_marvin_projectors`. Its 40-action model horizon stays fixed. It executes eight actions and carries the fast weights to the next observation. Set `execution_horizon` only to test a deliberate change in the action execution stride.
+
+To test integration with newly initialized TTT parameters, set `ROBOTTT_ALLOW_UNTRAINED_TTT=1`, set `ROBOTTT_GR00T_PROCESSOR`, and pass the official base snapshot directory as `ckpt_name`. The backend can compute Marvin normalization statistics from the 300 local benchmark demos or load the same statistics from `ROBOTTT_GR00T_STATISTICS`. This option does not load trained RoboTTT weights.
+
+To run the actual Isaac simulator, use the same `setup_eval_policy_server.sh` and `benchmark.sh evaluate` commands as above, with the native backend environment variables and native `ckpt_name`. This releases a finite action chunk to a simulator, advances the per-environment fast state once per chunk, and resets it between episodes. Benchmark success is measured separately in the recorded report.

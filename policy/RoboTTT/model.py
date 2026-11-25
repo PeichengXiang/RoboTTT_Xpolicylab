@@ -1,4 +1,4 @@
-"""XPolicyLab inference adapter for the three-camera Marvin simulation policy."""
+"""XPolicyLab inference for compact and native GR00T RoboTTT on Marvin."""
 
 import math
 import os
@@ -42,7 +42,27 @@ class Model(ModelTemplate):
         if self.device.type == "cpu":
             torch.set_num_threads(int(model_cfg.get("cpu_threads", 2)))
 
+        self.backend = os.environ.get("ROBOTTT_BACKEND") or model_cfg.get("backend", "compact")
+        self.denoise_steps = int(model_cfg.get("denoise_steps", 4))
+        if self.denoise_steps < 1:
+            raise ValueError("denoise_steps must be positive")
+        self.seed = int(model_cfg.get("seed") or 0)
+        self.reset_memory_each_chunk = bool(model_cfg.get("reset_memory_each_chunk", False))
+        self.lower, self.upper = self._action_bounds(model_cfg)
+
         root = resolve_checkpoint_root(model_cfg, POLICY_DIR / "checkpoints", policy_dir=POLICY_DIR)
+        if self.backend == "compact":
+            self._load_compact(root, model_cfg)
+        elif self.backend == "gr00t_n1_7":
+            from .gr00t_backend import Gr00tMarvin
+
+            self.model = Gr00tMarvin(root, model_cfg, self.device, self.action_dim, self.seed)
+            self.execution_horizon = self.model.execution_horizon
+        else:
+            raise ValueError(f"Unsupported RoboTTT backend {self.backend!r}")
+        self.reset()
+
+    def _load_compact(self, root, model_cfg):
         checkpoint = root / "latest.pt" if root.is_dir() else root
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.config = PolicyConfig(**saved["config"])
@@ -65,16 +85,9 @@ class Model(ModelTemplate):
         expected_tokens = len(CAMERAS) * self.grid ** 2 + self.task_token
         if self.grid < 1 or (token_count and token_count != expected_tokens):
             raise ValueError("Configured grid does not match the trained token count")
-        self.denoise_steps = int(model_cfg.get("denoise_steps", 4))
-        if self.denoise_steps < 1:
-            raise ValueError("denoise_steps must be positive")
-        self.seed = int(model_cfg.get("seed") or 0)
-        self.reset_memory_each_chunk = bool(model_cfg.get("reset_memory_each_chunk", False))
-        self.lower, self.upper = self._action_bounds(model_cfg)
-
         self.model = RoboTTT(self.config).to(self.device).eval()
         self.model.load_state_dict(saved["model"])
-        self.reset()
+        self.execution_horizon = self.config.horizon
         print(f"[RoboTTT] loaded {checkpoint} on {self.device} ({self.grid} × {self.grid} RGB patches)", flush=True)
 
     def _normalization(self, preprocessing, name, default):
@@ -137,23 +150,32 @@ class Model(ModelTemplate):
         frames = [np.asarray(obs["vision"][camera]["color"]) for camera in CAMERAS]
         if any(frame.ndim != 3 or frame.shape[-1] != 3 or frame.dtype != np.uint8 for frame in frames):
             raise ValueError("RoboTTT expects decoded HWC RGB uint8 camera observations")
-        context = self._encode_context(frames, obs)
         state = np.asarray(pack_robot_state(obs, self.action_type, self.dimensions), dtype=np.float32)
         if state.shape != (self.action_dim,) or not np.isfinite(state).all():
             raise ValueError("Expected a finite Marvin joint state")
-        state = (state - self.state_mean) / self.state_scale
         chunk_count = self.chunks.get(env_idx, 0)
         generator = torch.Generator(device=self.device).manual_seed(
             self.seed + 100_003 * env_idx + chunk_count
         )
         memory = None if self.reset_memory_each_chunk else self.memories.get(env_idx)
-        output, result_memory = self.model.sample(
-            torch.from_numpy(context).to(self.device),
-            torch.from_numpy(state[None]).to(self.device),
-            memory, denoise_steps=self.denoise_steps, generator=generator,
-        )
-        actions = output[0].float().cpu().numpy() * self.action_scale + self.action_mean
-        if actions.shape != (self.config.horizon, self.action_dim) or not np.isfinite(actions).all():
+        if self.backend == "gr00t_n1_7":
+            instruction = obs.get("instruction") or obs.get("instructions")
+            if not isinstance(instruction, str) or not instruction.strip():
+                raise ValueError("GR00T RoboTTT requires a nonempty instruction")
+            actions, result_memory = self.model.sample(
+                frames, state, instruction, memory,
+                denoise_steps=self.denoise_steps, generator=generator,
+            )
+        else:
+            context = self._encode_context(frames, obs)
+            state = (state - self.state_mean) / self.state_scale
+            output, result_memory = self.model.sample(
+                torch.from_numpy(context).to(self.device),
+                torch.from_numpy(state[None]).to(self.device),
+                memory, denoise_steps=self.denoise_steps, generator=generator,
+            )
+            actions = output[0].float().cpu().numpy() * self.action_scale + self.action_mean
+        if actions.shape != (self.execution_horizon, self.action_dim) or not np.isfinite(actions).all():
             raise RuntimeError("RoboTTT returned an invalid joint chunk")
         actions = unpack_robot_state(np.clip(actions, self.lower, self.upper), self.action_type, self.dimensions)
         return actions, result_memory, chunk_count + 1

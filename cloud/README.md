@@ -1,5 +1,24 @@
 # 阿里云 PAI DLC 训练
 
+## 官方 GR00T N1.7 训练入口
+
+使用单节点四张同型号的完整 A100 或 A800 GPU。DLC worker 安装固定版本的 NVIDIA Isaac-GR00T `708617f5716c63fc0a327391492ea2b91977ae90`，使用其 Python 3.12、PyTorch 2.9/CUDA 12.8 和 Transformers 4.57.3 依赖。原来的 CPU DSW 可用于校验 NAS 文件和提交 DLC。
+
+在 `/mnt/workspace/robottt/assets` 准备官方 `GR00T-N1.7-3B` 的 `373d34e2723d928870157d07dc216a19a624b5bb` 快照到 `gr00t-n1.7-3b-373d34e`，并准备公开的 Qwen3-VL-2B-Instruct 处理器文件到 `qwen3-vl-2b-processor-8964489`。脚本核验官方权重的 SHA-256 及处理器文件与 Cosmos 相同的 Git blob 哈希。DLC 端以离线方式加载已验的模型文件。 [官方权重](https://huggingface.co/nvidia/GR00T-N1.7-3B/tree/373d34e2723d928870157d07dc216a19a624b5bb) · [公开处理器快照](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/tree/89644892e4d85e24eaac8bacfd4f463576704203)
+
+四卡验证作业使用单独的 `ROBOTTT_RUN_DIR`，取四条最长的真实示范，每卡一条。本地数据的四条序列为 169 至 192 次完整策略调用。每 8 次调用截断梯度，完成一个 BF16 优化器步，并保存验证用 checkpoint。确认四个 rank 都完成反向传播、损失和梯度有限，且 XPolicyLab 的闭环验证通过，再提交正式作业。
+
+```bash
+ROBOTTT_RUN_DIR=/mnt/workspace/robottt/runs/gr00t-n1.7-smoke bash cloud/run_gr00t_dlc.sh smoke
+ROBOTTT_RUN_DIR=/mnt/workspace/robottt/runs/gr00t-n1.7-50k bash cloud/run_gr00t_dlc.sh train
+```
+
+正式作业读取 `/mnt/workspace/raw` 的 300 条示范，每项 50 条，先缓存冻结视觉语言模型的真实特征，再进入训练。四卡各累积 16 条轨迹，等效全局 batch 64。固定 50,000 个优化器步，每 10,000 步产出 `step_NNNNNN.pt`，`latest.pt` 指向最近一次完整保存。恢复时使用原 `ROBOTTT_RUN_DIR` 并设置 `ROBOTTT_RESUME` 指向命名 checkpoint。模型、数据、调度和 DDP 配置须和原次运行一致。
+
+仓库的 [论文对照](../REPRODUCTION.md#公开权重在-insert-benchmark-的训练设置)列出上下文定义、稳定化及优化范围。DLC 日志中的 `vlm_cache_episode` 记录真实特征处理进度，`train` 记录损失、梯度、上下文长度、耗时和显存峰值，`checkpoint` 记录保存位置。
+
+## 早期小模型训练入口
+
 用同一份 NAS 的 `raw` 目录。程序直接读取 Insert Benchmark HDF5，不需要生成 LeRobot 副本。正式训练使用 300 条示范，六个任务各 50 条。benchmark 自带的测试种子用于独立闭环评估。
 
 ## 在 CPU DSW 做数据预检

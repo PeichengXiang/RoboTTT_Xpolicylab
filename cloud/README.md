@@ -22,6 +22,8 @@ ROBOTTT_RUN_DIR=/mnt/workspace/robottt/runs/gr00t-n1.7-50k bash cloud/run_gr00t_
 
 正式作业读取 `/mnt/workspace/raw` 的 300 条示范，每项 50 条，先缓存冻结视觉语言模型的真实特征，再进入训练。上下文从 7 个动作块起，前 10,000 步逐步增加至 39 个块。四卡各累积 16 条轨迹，等效全局 batch 64。固定 50,000 个优化器步，每 10,000 步产出 `step_NNNNNN.pt`，`latest.pt` 指向最近一次完整保存。恢复时使用原 `ROBOTTT_RUN_DIR` 并设置 `ROBOTTT_RESUME` 指向命名 checkpoint。模型、数据、调度和 DDP 配置须和原次运行一致。
 
+需要先评估 1,000 步时，可用同一启动脚本的 `pilot` 模式。它沿用 50,000 步的学习率和上下文计划，到第 1,000 步保存 `step_001000.pt` 和优化器状态后正常退出。评估后设置 `ROBOTTT_RESUME` 为这个 checkpoint，并用同一输出目录的 `train` 模式从第 1,001 步继续。常规保存点仍为 10,000、20,000、30,000、40,000 和 50,000 步。
+
 仓库的 [论文对照](../REPRODUCTION.md#公开权重在-insert-benchmark-的训练设置)列出上下文定义、稳定化及优化范围。DLC 日志中的 `vlm_cache_episode` 记录真实特征处理进度，`train` 记录损失、梯度、上下文长度、耗时和显存峰值，`checkpoint` 记录保存位置。
 
 ## 早期小模型训练入口

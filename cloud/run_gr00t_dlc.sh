@@ -6,8 +6,8 @@ cd "$repo_dir"
 
 mode="${1:-}"
 case "$mode" in
-    smoke|train) ;;
-    *) echo "Usage: bash cloud/run_gr00t_dlc.sh {smoke|train}" >&2; exit 2 ;;
+    smoke|pilot|train) ;;
+    *) echo "Usage: bash cloud/run_gr00t_dlc.sh {smoke|pilot|train}" >&2; exit 2 ;;
 esac
 
 nas="${ROBOTTT_NAS_ROOT:-/mnt/workspace}"
@@ -47,7 +47,12 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 case "$mode" in
     smoke) settings=(--smoke --steps 3 --global-batch 64 --context 39 --context-start 39 --context-warmup 0 --save-every 3) ;;
-    train) settings=(--steps 50000 --global-batch 64 --context 39 --context-start 7 --context-warmup 10000 --save-every 10000) ;;
+    pilot|train)
+        settings=(--steps 50000 --global-batch 64 --context 39 --context-start 7 --context-warmup 10000 --save-every 10000)
+        if [[ "$mode" == pilot ]]; then
+            settings+=(--stop-after 1000)
+        fi
+        ;;
 esac
 resume=()
 if [[ -n "${ROBOTTT_RESUME:-}" ]]; then

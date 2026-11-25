@@ -87,15 +87,20 @@ def _adapter_state(policy):
     return {name: parameter.detach() for name, parameter in policy.named_parameters() if parameter.requires_grad}
 
 
-def _load_resume(policy, optimizer, path, metadata):
+def _load_resume(policy, optimizer, path, metadata, stop_at):
     saved = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     if any(saved.get(key) != value for key, value in metadata.items() if key != "marvin_statistics"):
         raise ValueError("Resume requires identical base, data, rollout and training settings")
+    completed = int(saved["step"])
+    if not 0 <= completed < metadata["settings"]["steps"]:
+        raise ValueError(f"Unexpected completed optimizer step {completed}")
+    if completed >= stop_at:
+        raise ValueError(f"Checkpoint already completed step {completed}. Set --stop-after above that step or omit it")
     if set(saved["adapter"]) != set(_adapter_state(policy)):
         raise ValueError("Adapter keys differ from the current trainable parameters")
     policy.load_state_dict(saved["adapter"], strict=False)
     optimizer.load_state_dict(saved["optimizer"])
-    return int(saved["step"])
+    return completed
 
 
 def _lr_scale(args, step):
@@ -159,9 +164,8 @@ def train(args, rank, world, device):
         {"params": projectors, "lr": 5e-5, "weight_decay": 0.0},
     ], foreach=False)
     metadata = _metadata(args, data_sha256, world, stats)
-    start = _load_resume(policy, optimizer, args.resume, metadata) if args.resume else 0
-    if not 0 <= start < args.steps:
-        raise ValueError(f"Unexpected completed optimizer step {start}")
+    stop_at = min(args.stop_after, args.steps) if args.stop_after is not None else args.steps
+    start = _load_resume(policy, optimizer, args.resume, metadata, stop_at) if args.resume else 0
     model = policy
     if world > 1:
         # TBPTT carries a structured output into the next segment. Let DDP
@@ -178,7 +182,7 @@ def train(args, rank, world, device):
               trainable_parameters=sum(p.numel() for p in ttt + projectors))
     sampling = iter(StepBatchSampler(args, len(train_episodes), rank, world, start))
     args.output.mkdir(parents=True, exist_ok=True)
-    for step in range(start + 1, args.steps + 1):
+    for step in range(start + 1, stop_at + 1):
         begun = perf_counter()
         scale = _lr_scale(args, step)
         for group, peak in zip(optimizer.param_groups, (2e-5, 5e-5), strict=True):
@@ -192,7 +196,7 @@ def train(args, rank, world, device):
             dist.all_gather(gates, policy.gates.detach())
             for value in gates[1:]:
                 torch.testing.assert_close(gates[0], value, atol=0, rtol=0)
-        if args.smoke or step == 1 or step % args.log_every == 0:
+        if args.smoke or step == 1 or step % args.log_every == 0 or (args.stop_after is not None and step == stop_at):
             metrics = torch.tensor([loss.item(), grad.item(), shortest, longest, context_count, perf_counter() - begun,
                                     torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0],
                                    device=device)
@@ -207,7 +211,7 @@ def train(args, rank, world, device):
                       context_min=int(rows[:, 2].min().item()), context_max=int(rows[:, 3].max().item()),
                       context_total=int(rows[:, 4].sum().item()), context_rank_max=int(rows[:, 4].max().item()),
                       step_seconds=rows[:, 5].max().item(), peak_gpu_gib=rows[:, 6].max().item())
-        if step % args.save_every == 0 or step == args.steps:
+        if step % args.save_every == 0 or step == stop_at:
             if rank == 0:
                 path = args.output / f"step_{step:06d}.pt"
                 _save(path, {**metadata, "step": step, "adapter": _adapter_state(policy), "optimizer": optimizer.state_dict()})
@@ -228,6 +232,8 @@ def main():
         parser.add_argument(f"--{key}", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--steps", type=int, default=50000)
+    parser.add_argument("--stop-after", type=int,
+                        help="Save and stop at this absolute optimizer step while preserving the --steps schedule")
     parser.add_argument("--global-batch", type=int, default=64)
     parser.add_argument("--stride", type=int, default=STRIDE, help="Raw-frame interval between policy windows (native horizon: 40)")
     parser.add_argument("--context", type=int, help="Maximum policy contexts (default matches the span of 192 stride-8 contexts)")
@@ -256,6 +262,8 @@ def main():
                 args.vlm_batch, args.save_every, args.log_every)
     if min(positive) < 1 or min(args.warmup, args.context_warmup, args.seed) < 0:
         parser.error("Invalid nonpositive training setting")
+    if args.stop_after is not None and args.stop_after < 1:
+        parser.error("--stop-after must be positive")
     if args.global_batch % world or args.context_start > args.context:
         parser.error("Need a global batch divisible by world size and a nondecreasing context schedule")
     if args.smoke and (args.context_warmup or args.context_start != args.context or args.steps > 5):

@@ -25,11 +25,10 @@ if [[ "$nas" == / || "$output" != "$nas/"* || ! -d "$data" ]]; then
     exit 2
 fi
 
-"$python" - "$base" "$processor" <<'PY'
-from hashlib import sha1, sha256
-from pathlib import Path
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_ALBUMENTATIONS_UPDATE=1
+
+"$python" - <<'PY'
 import re
-import sys
 
 import torch
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
@@ -40,37 +39,10 @@ if (len(names) != 4 or not all(models) or len({match.group() for match in models
         or any("MIG" in name.upper() for name in names) or not torch.cuda.is_bf16_supported()):
     raise SystemExit(f"Expected 4 full, same-model NVIDIA A100s or A800s with BF16 support, got {names}")
 
-base, processor = map(Path, sys.argv[1:])
-shards = {
-    "model-00001-of-00002.safetensors": "8a1a1d8a33c99103c7c80c136073c5bb8bfe9ca8f7a970c93c033ea89742906d",
-    "model-00002-of-00002.safetensors": "c3f61940deb2007ba1ad7743013b57f0f8462356151db9655175d7aca2d40661",
-}
-for name, expected in shards.items():
-    digest = sha256()
-    with (base / name).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    if digest.hexdigest() != expected:
-        raise SystemExit(f"Official snapshot SHA-256 mismatch for {name}")
-
-processing_blobs = {
-    "tokenizer.json": "c6cc1014128b19d1fc46b1d30a23e3b1d35db421",
-    "tokenizer_config.json": "d3d3763207692c78780f4f42d4dadf49a5c8012",
-    "preprocessor_config.json": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
-    "video_preprocessor_config.json": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
-    "merges.txt": "20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0",
-    "vocab.json": "4783fe10ac3adce15ac8f358ef5462739852c569",
-    "chat_template.json": "e49e75bdda104c8de941eb20e0b3765184fb27bc",
-    "config.json": "0cd8c646eb55794594b14fefcd1d3acea5cc000f",
-}
-for name, expected in processing_blobs.items():
-    data = (processor / name).read_bytes()
-    if sha1(f"blob {len(data)}\0".encode() + data).hexdigest() != expected:
-        raise SystemExit(f"Cosmos-compatible public processor hash mismatch for {name}")
-print(f"Verified official GR00T, exact processor files, BF16 GPUs {names}, and the NVIDIA processor import", flush=True)
+print(f"Verified BF16 GPUs {names} and the NVIDIA processor import", flush=True)
 PY
 
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_ALBUMENTATIONS_UPDATE=1
+"$python" cloud/stage_gr00t_assets.py verify "$assets"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 case "$mode" in

@@ -6,6 +6,13 @@
 
 在 `/mnt/workspace/robottt/assets` 准备官方 `GR00T-N1.7-3B` 的 `373d34e2723d928870157d07dc216a19a624b5bb` 快照到 `gr00t-n1.7-3b-373d34e`，并准备公开的 Qwen3-VL-2B-Instruct 处理器文件到 `qwen3-vl-2b-processor-8964489`。脚本核验官方权重的 SHA-256 及处理器文件与 Cosmos 相同的 Git blob 哈希。DLC 端以离线方式加载已验的模型文件。 [官方权重](https://huggingface.co/nvidia/GR00T-N1.7-3B/tree/373d34e2723d928870157d07dc216a19a624b5bb) · [公开处理器快照](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/tree/89644892e4d85e24eaac8bacfd4f463576704203)
 
+在 CPU DSW 的源码目录执行以下准备步骤。下载支持断点恢复。`--endpoint` 可指定可达的镜像，所有文件仍由固定摘要校验。DLC 使用第二个脚本输出的绝对 `ROBOTTT_PYTHON` 路径。
+
+```bash
+python3 cloud/stage_gr00t_assets.py stage /mnt/workspace/robottt/assets
+bash cloud/prepare_gr00t_runtime.sh
+```
+
 四卡验证作业使用单独的 `ROBOTTT_RUN_DIR`，取四条最长的真实示范，每卡一条。本地数据的四条序列为 169 至 192 次完整策略调用。每 8 次调用截断梯度，完成一个 BF16 优化器步，并保存验证用 checkpoint。确认四个 rank 都完成反向传播、损失和梯度有限，且 XPolicyLab 的闭环验证通过，再提交正式作业。
 
 ```bash

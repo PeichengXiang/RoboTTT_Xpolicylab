@@ -12,6 +12,64 @@ from .policy import RolloutState, corrupt_actions
 from .ttt import TTTMLP
 
 
+def _checkpoint_tensors(checkpoint: Path, prefix: str):
+    from safetensors import safe_open
+
+    index = checkpoint / "model.safetensors.index.json"
+    if not index.is_file():
+        with safe_open(checkpoint / "model.safetensors", framework="pt", device="cpu") as handle:
+            return {
+                name.removeprefix(prefix): handle.get_tensor(name)
+                for name in handle.keys() if name.startswith(prefix)
+            }
+
+    shards = defaultdict(list)
+    for name, shard in json.loads(index.read_text())["weight_map"].items():
+        if name.startswith(prefix):
+            shards[shard].append(name)
+    weights = {}
+    for shard, names in shards.items():
+        with safe_open(checkpoint / shard, framework="pt", device="cpu") as handle:
+            weights.update({name.removeprefix(prefix): handle.get_tensor(name) for name in names})
+    return weights
+
+
+def load_public_backbone(checkpoint: str | Path, processor_assets: str | Path, *,
+                         device: str | torch.device = "cpu", dtype: torch.dtype | None = None):
+    """Restore the frozen native VLM from GR00T's own safetensors snapshot.
+
+    Use the corresponding Cosmos-Reason2-2B config or a verified byte-identical
+    public copy. The model parameters all come from the GR00T snapshot.
+    """
+    from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+    from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
+    from transformers import AutoConfig, Qwen3VLForConditionalGeneration
+
+    class SnapshotBackbone(Qwen3Backbone):
+        def __init__(self, select_layer, vlm_config):
+            nn.Module.__init__(self)
+            self.model = Qwen3VLForConditionalGeneration._from_config(
+                vlm_config, attn_implementation="sdpa",
+            )
+            self.select_layer = select_layer
+            while len(self.model.language_model.layers) > select_layer:
+                self.model.language_model.layers.pop(-1)
+            self.set_trainable_parameters(False, False, 0)
+
+    checkpoint = Path(checkpoint)
+    config = Gr00tN1d7Config.from_pretrained(checkpoint, local_files_only=True)
+    vlm_config = AutoConfig.from_pretrained(Path(processor_assets), local_files_only=True)
+    with torch.device("meta"):
+        backbone = SnapshotBackbone(config.select_layer, vlm_config).eval()
+    backbone.load_state_dict(_checkpoint_tensors(checkpoint, "backbone."), strict=True, assign=True)
+    # The analytic RoPE buffers are the only VLM state absent from safetensors.
+    backbone._reset_rotary_inv_freq()
+    backbone.to(device=device, dtype=dtype)
+    backbone._reset_rotary_inv_freq()
+    backbone._apply_vision_patch_embed_channels_last()
+    return backbone.requires_grad_(False)
+
+
 class Gr00tRoboTTT(nn.Module):
     """Sequence wrapper for the public Gr00tN1d7ActionHead.
 
@@ -23,6 +81,7 @@ class Gr00tRoboTTT(nn.Module):
     def __init__(
         self, action_head: nn.Module, *, registers: int = 16, ttt_heads: int = 32,
         gate_init: float = 0.001, embodiment_id: int | None = None,
+        stabilize_fast_weights: bool = False,
     ):
         super().__init__()
         if registers < 0 or ttt_heads < 1:
@@ -36,7 +95,9 @@ class Gr00tRoboTTT(nn.Module):
         self.registers = nn.Parameter(weight.new_empty((registers, action_head.input_embedding_dim)))
         nn.init.normal_(self.registers, std=0.02)
         self.memories = nn.ModuleList(
-            TTTMLP(width, heads=ttt_heads).to(device=weight.device, dtype=weight.dtype)
+            TTTMLP(width, heads=ttt_heads, stabilize=stabilize_fast_weights).to(
+                device=weight.device, dtype=weight.dtype,
+            )
             for _ in action_head.model.transformer_blocks
         )
         self.gates = nn.Parameter(weight.new_full((len(self.memories), width), gate_init))
@@ -51,28 +112,10 @@ class Gr00tRoboTTT(nn.Module):
         """
         from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
         from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
-        from safetensors import safe_open
 
         checkpoint = Path(checkpoint)
         head = Gr00tN1d7ActionHead(Gr00tN1d7Config.from_pretrained(checkpoint, local_files_only=True))
-        prefix = "action_head."
-        weights = {}
-        index = checkpoint / "model.safetensors.index.json"
-        if index.is_file():
-            shards = defaultdict(list)
-            for name, shard in json.loads(index.read_text())["weight_map"].items():
-                if name.startswith(prefix):
-                    shards[shard].append(name)
-            for shard, names in shards.items():
-                with safe_open(checkpoint / shard, framework="pt", device="cpu") as handle:
-                    weights.update({name.removeprefix(prefix): handle.get_tensor(name) for name in names})
-        else:
-            with safe_open(checkpoint / "model.safetensors", framework="pt", device="cpu") as handle:
-                weights = {
-                    name.removeprefix(prefix): handle.get_tensor(name)
-                    for name in handle.keys() if name.startswith(prefix)
-                }
-        head.load_state_dict(weights, strict=True)
+        head.load_state_dict(_checkpoint_tensors(checkpoint, "action_head."), strict=True)
         return cls(head, **kwargs)
 
     def set_stage(self, stage: str):

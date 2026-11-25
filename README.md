@@ -2,7 +2,7 @@
 
 本项目实现 RoboTTT 的快权重动作头、序列 flow matching、TBPTT 及仅作为上下文的轨迹片段。附带小型闭环任务、NPZ 训练输入、光模块插拔仿真演示转换器，以及接入公开 GR00T N1.7 动作头的接口。论文中未给出的配置及公开模型与论文骨干的差异见 [论文对照与复现假设](REPRODUCTION.md)。
 
-## XPolicyLab 与六任务训练
+## XPolicyLab 与此前的六任务训练
 
 仓库包含 [XPolicyLab RoboTTT 适配器](policy/RoboTTT/README.md)，支持天机仿真的 `marvin_dual_gripper` 和 `joint` 控制。通过标准 `ModelTemplate` 和 WebSocket 加载训练 checkpoint，三路 RGB 与 16 维关节/夹爪状态由各环境独立推进快权重。
 
@@ -13,7 +13,7 @@ ROBOTTT_DATA_ROOT=/path/to/benchmark_data bash cloud/run_dlc.sh check
 
 [阿里云 DLC 训练入口](cloud/README.md)使用一个节点上的 4 张 A100 或 4 张 A800。有效全局 batch 为 64 条轨迹序列，默认每卡 micro-batch 16，总计 50,000 个优化器步。训练读取 NAS 的 `/mnt/workspace/raw`，要求六个任务各有 50 条 HDF5 示范。官方测试种子独立于这 300 条训练轨迹。
 
-这次训练使用本项目的小型 RoboTTT 动作头，保留 TTT-MLP、序列 flow matching 与 TBPTT。三相机图像用 RGB patch token，训练中逐步将上下文上限从 32 增至 192 个策略调用，每次预测 8 个 30 Hz 动作。任务文本用六个固定任务 ID 编码。论文中的 Eagle/GR00T 初始化与预训练数据仍不可用。
+此前的 DLC 训练使用本项目的小型 RoboTTT 动作头，保留 TTT-MLP、序列 flow matching 与 TBPTT。三相机图像用 RGB patch token，训练中逐步将上下文上限从 32 增至 192 个策略调用，每次预测 8 个 30 Hz 动作。任务文本用六个固定任务 ID 编码。公开 GR00T 的实权重验证见下表。
 
 ## 本机结果
 
@@ -22,7 +22,7 @@ ROBOTTT_DATA_ROOT=/path/to/benchmark_data bash cloud/run_dlc.sh check
 | 合成双目标闭环，24 个固定测试种子 | 正确前缀 **23/24**，反转与去除线索均 **0/24**。同一 checkpoint 每次预测前重置快权重 **0/24**。单帧基线 **10/24**，对三种前缀的输出完全相同。 |
 | 8192 个上下文更新 | 快权重张量总量始终 **8832 bytes**，单次 4 步去噪平均约 **3.93 → 3.86 ms**。对段长 128 的 TBPTT，1024 与 8192 步的 PyTorch CUDA 峰值分配均为 **40.16 MiB**。 |
 | Isaac Sim 插入并拔出，`timed_single` seed 25001 | 使用 12 条示范训练、4 条独立示范做离线验证。TTT 和单帧基线分别完成 **480/480** 个控制步，接口均无报错，插拔得分均为 **0/1**。 |
-| 公开 GR00T N1.7 | 以公开的 32 层配置和随机初始化参数通过 BF16 推理、快权重跨步传递。移除 register token 并关闭 TTT 门控后，四步去噪与原生动作头一致。官方权重索引的 537 个头部键与当前实现匹配。已验证小型本地 safetensors 装载，公开大权重尚未运行。 |
+| 公开 GR00T N1.7 | 官方两份 safetensors 通过 SHA-256 校验，严格加载全部 494 个视觉语言骨干张量和 537 个动作头张量。使用真实 `precision_single` 轨迹的三路 RGB 和任务指令，通过 CPU FP32 推理和一次动作监督 AdamW 更新，冻结的官方动作头参数哈希一致。移除 register token、关闭 TTT 门控并固定去噪噪声后，输出与官方动作头逐元素一致。 |
 
 本机工作区保留了早期实验的合成与插拔 checkpoint 及指标。Git 仓库保存源码与文档。8192 步的测量使用小模型和随机输入，反映状态存储与训练显存的变化。YAM 真机结果和论文的闭环上下文缩放曲线仍待原版实验数据、权重与设备。
 
@@ -119,5 +119,11 @@ carry = carry.detach()  # TBPTT 段边界
 ```
 
 `features[B,T,V,D]` 来自上游 backbone 输出的 `backbone_features`；另外传入 `backbone_attention_mask` 和 `image_mask`。本体状态、action horizon、动作通道和补位掩码以相应 GR00T processor 配置为准。推理用 `policy.eval().sample`，单次调用移除上述输入的 T 维；返回动作块和下一状态。`set_stage("pretrain")` 冻结原动作头，`set_stage("posttrain")` 解冻原动作头。上面的缓存特征用法仅微调动作头，全 VLM 后训练需要额外接入 VLM 训练。
+
+`robottt.gr00t_insert` 将 Insert Benchmark 的 HDF5 示范读为官方 `VLAStepData`。使用 `marvin_modalities(40)` 注册 `NEW_EMBODIMENT`，使用 `marvin_statistics(train_episodes)` 为训练集计算归一化统计。`read_marvin_step` 保留三路 RGB、轨迹中的任务指令，以及按同一控制步对齐的 16 维绝对关节目标。官方 processor 将动作块从 `40 × 16` 补齐为 `40 × 132`，训练损失应使用其 `action_mask`。Marvin 使用新本体的投影槽，需要在此本体数据上训练才能评估任务成功率。
+
+`load_public_backbone(snapshot, processor_assets, device=..., dtype=...)` 从同一份 GR00T snapshot 加载冻结的视觉语言模型。发布的 snapshot revision 为 `373d34e2723d928870157d07dc216a19a624b5bb`。原生 `Gr00tN1d7Processor` 的 `model_name` 可指向本地兼容处理器目录。验证使用 Qwen3-VL-2B-Instruct 公开 revision `89644892e4d85e24eaac8bacfd4f463576704203` 的八个配置与 tokenizer 文件，其 Git blob 哈希逐一与 Cosmos-Reason2-2B revision `9ce19a195e423419c349abfc86fd07178b230561` 相同。视觉语言模型的全部权重来自 GR00T snapshot。 [GR00T snapshot](https://huggingface.co/nvidia/GR00T-N1.7-3B/tree/373d34e2723d928870157d07dc216a19a624b5bb) · [Qwen 文件](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/tree/89644892e4d85e24eaac8bacfd4f463576704203) · [Cosmos 文件](https://huggingface.co/nvidia/Cosmos-Reason2-2B/tree/9ce19a195e423419c349abfc86fd07178b230561)
+
+真实图像单批验证通过后，另一次 TTT 初始化在三组不同噪声下均产生非有限动作。对同一组模型参数启用 `stabilize_fast_weights=True` 后，三组输出均为有限值。该选项复用已有的范数约束，默认保留原始内循环更新。四卡 BF16 长序列训练仍待验证。
 
 公开 GR00T checkpoint 的配置为 Cosmos/Qwen3-VL、32 层 DiT，论文配置为 Eagle、16 层 DiT。接入接口按实际动作头的层数插入 TTT。[公开权重配置](https://huggingface.co/nvidia/GR00T-N1.7-3B/blob/main/config.json)

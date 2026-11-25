@@ -13,14 +13,14 @@ python3 cloud/stage_gr00t_assets.py stage /mnt/workspace/robottt/assets
 bash cloud/prepare_gr00t_runtime.sh
 ```
 
-四卡验证作业使用单独的 `ROBOTTT_RUN_DIR`，取四条最长的真实示范，每卡一条。本地数据的四条序列为 169 至 192 次完整策略调用。每 8 次调用截断梯度，完成一个 BF16 优化器步，并保存验证用 checkpoint。确认四个 rank 都完成反向传播、损失和梯度有限，且 XPolicyLab 的闭环验证通过，再提交正式作业。
+四卡验证作业使用单独的 `ROBOTTT_RUN_DIR`，以最长的 64 条真实示范进行 3 次 BF16 优化器更新，每卡累积 16 条。训练使用每块 40 个动作的非重叠切分，上下文固定为最多 39 个块，每 8 个块截断梯度。确认四个 rank 都完成反向传播、损失和梯度有限、第三步成功保存，且 XPolicyLab 的闭环验证通过，再提交正式作业。
 
 ```bash
 ROBOTTT_RUN_DIR=/mnt/workspace/robottt/runs/gr00t-n1.7-smoke bash cloud/run_gr00t_dlc.sh smoke
 ROBOTTT_RUN_DIR=/mnt/workspace/robottt/runs/gr00t-n1.7-50k bash cloud/run_gr00t_dlc.sh train
 ```
 
-正式作业读取 `/mnt/workspace/raw` 的 300 条示范，每项 50 条，先缓存冻结视觉语言模型的真实特征，再进入训练。四卡各累积 16 条轨迹，等效全局 batch 64。固定 50,000 个优化器步，每 10,000 步产出 `step_NNNNNN.pt`，`latest.pt` 指向最近一次完整保存。恢复时使用原 `ROBOTTT_RUN_DIR` 并设置 `ROBOTTT_RESUME` 指向命名 checkpoint。模型、数据、调度和 DDP 配置须和原次运行一致。
+正式作业读取 `/mnt/workspace/raw` 的 300 条示范，每项 50 条，先缓存冻结视觉语言模型的真实特征，再进入训练。上下文从 7 个动作块起，前 10,000 步逐步增加至 39 个块。四卡各累积 16 条轨迹，等效全局 batch 64。固定 50,000 个优化器步，每 10,000 步产出 `step_NNNNNN.pt`，`latest.pt` 指向最近一次完整保存。恢复时使用原 `ROBOTTT_RUN_DIR` 并设置 `ROBOTTT_RESUME` 指向命名 checkpoint。模型、数据、调度和 DDP 配置须和原次运行一致。
 
 仓库的 [论文对照](../REPRODUCTION.md#公开权重在-insert-benchmark-的训练设置)列出上下文定义、稳定化及优化范围。DLC 日志中的 `vlm_cache_episode` 记录真实特征处理进度，`train` 记录损失、梯度、上下文长度、耗时和显存峰值，`checkpoint` 记录保存位置。
 

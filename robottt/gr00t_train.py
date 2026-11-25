@@ -38,7 +38,7 @@ def train_step(model, optimizer, selections, episodes, cache, args, device, rank
     noise_gen = torch.Generator(device=device).manual_seed(args.seed + step * 8192 + rank)
     for index, (episode_id, crop_seed, context) in enumerate(selections):
         episode = episodes[episode_id]
-        chunks = episode_chunks(episode)
+        chunks = episode_chunks(episode, args.stride)
         length = min(chunks, context)
         first = int(np.random.default_rng(crop_seed).integers(chunks - length + 1))
         lengths.append(length)
@@ -65,7 +65,7 @@ def train_step(model, optimizer, selections, episodes, cache, args, device, rank
             local_loss += loss.detach()
     grad = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
     optimizer.step()
-    return local_loss, grad.detach(), min(lengths), max(lengths)
+    return local_loss, grad.detach(), min(lengths), max(lengths), sum(lengths)
 
 
 def _settings(args):
@@ -79,7 +79,7 @@ def _metadata(args, data_sha256, world, stats):
         "tune_marvin_projectors": True, "marvin_statistics": stats,
         "base_revision": BASE_REVISION, "processor_revision": PROCESSOR_REVISION,
         "isaac_gr00t_revision": UPSTREAM_REVISION, "data_sha256": data_sha256,
-        "stride": STRIDE, "horizon": HORIZON, "world_size": world, "settings": _settings(args),
+        "stride": args.stride, "horizon": HORIZON, "world_size": world, "settings": _settings(args),
     }
 
 
@@ -118,19 +118,28 @@ def train(args, rank, world, device):
     episodes = scan_episodes(args.data, HORIZON, 1, expected_per_task=50)
     data_sha256 = manifest(episodes, episodes, [])["sha256"]
     stats = marvin_statistics(episodes)
-    cache = cache_directory(args.cache, data_sha256)
+    cache = cache_directory(args.cache, data_sha256, args.stride)
+    dense_cache = (
+        cache_directory(args.cache, data_sha256, STRIDE)
+        if args.stride > STRIDE and args.stride % STRIDE == 0 else None
+    )
     train_episodes = episodes
     if args.smoke:
-        longest = sorted(episodes, key=episode_chunks, reverse=True)
+        longest = sorted(episodes, key=lambda episode: episode_chunks(episode, args.stride), reverse=True)
         train_episodes = longest[:args.global_batch]
-        if episode_chunks(train_episodes[0]) < args.context or episode_chunks(train_episodes[-1]) <= args.segment:
+        if (episode_chunks(train_episodes[0], args.stride) < args.context
+                or episode_chunks(train_episodes[-1], args.stride) <= args.segment):
             raise ValueError("Smoke requires at least one full context and multiple TBPTT segments per rank")
     local_episodes = train_episodes[rank::world]
 
     def cached(episode, index, total):
         _emit(event="vlm_cache_episode", rank=rank, episode=episode.seed, level=episode.level, done=index, total=total)
 
-    build_cache(local_episodes, cache, args.base, args.processor_assets, stats, device, args.vlm_batch, cached)
+    counts = build_cache(
+        local_episodes, cache, args.base, args.processor_assets, stats, device, args.vlm_batch, cached,
+        stride=args.stride, dense_cache=dense_cache,
+    )
+    _emit(event="vlm_cache_summary", rank=rank, stride=args.stride, episodes=len(local_episodes), **counts)
     _sync()
     if args.cache_only:
         return
@@ -164,7 +173,7 @@ def train(args, rank, world, device):
     model.train()
     if rank == 0:
         _emit(event="configuration", **_argument_values(args), world_size=world, data_sha256=data_sha256,
-              base_revision=BASE_REVISION, horizon=HORIZON, stride=STRIDE, active_episodes=len(train_episodes),
+              base_revision=BASE_REVISION, horizon=HORIZON, active_episodes=len(train_episodes),
               model_dtype=str(model_dtype), ttt_dtype="torch.float32",
               trainable_parameters=sum(p.numel() for p in ttt + projectors))
     sampling = iter(StepBatchSampler(args, len(train_episodes), rank, world, start))
@@ -175,14 +184,16 @@ def train(args, rank, world, device):
         for group, peak in zip(optimizer.param_groups, (2e-5, 5e-5), strict=True):
             group["lr"] = scale * peak
         selections = [next(sampling)[0] for _ in range(args.global_batch // world)]
-        loss, grad, shortest, longest = train_step(model, optimizer, selections, train_episodes, cache, args, device, rank, step)
+        loss, grad, shortest, longest, context_count = train_step(
+            model, optimizer, selections, train_episodes, cache, args, device, rank, step,
+        )
         if args.smoke and world > 1:
             gates = [torch.empty_like(policy.gates) for _ in range(world)]
             dist.all_gather(gates, policy.gates.detach())
             for value in gates[1:]:
                 torch.testing.assert_close(gates[0], value, atol=0, rtol=0)
         if args.smoke or step == 1 or step % args.log_every == 0:
-            metrics = torch.tensor([loss.item(), grad.item(), shortest, longest, perf_counter() - begun,
+            metrics = torch.tensor([loss.item(), grad.item(), shortest, longest, context_count, perf_counter() - begun,
                                     torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0],
                                    device=device)
             peer_metrics = [torch.empty_like(metrics) for _ in range(world)]
@@ -194,7 +205,8 @@ def train(args, rank, world, device):
                 rows = torch.stack(peer_metrics).cpu()
                 _emit(event="train", step=step, loss=rows[:, 0].mean().item(), grad_norm=grad.item(),
                       context_min=int(rows[:, 2].min().item()), context_max=int(rows[:, 3].max().item()),
-                      step_seconds=rows[:, 4].max().item(), peak_gpu_gib=rows[:, 5].max().item())
+                      context_total=int(rows[:, 4].sum().item()), context_rank_max=int(rows[:, 4].max().item()),
+                      step_seconds=rows[:, 5].max().item(), peak_gpu_gib=rows[:, 6].max().item())
         if step % args.save_every == 0 or step == args.steps:
             if rank == 0:
                 path = args.output / f"step_{step:06d}.pt"
@@ -217,8 +229,9 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--global-batch", type=int, default=64)
-    parser.add_argument("--context", type=int, default=192)
-    parser.add_argument("--context-start", type=int, default=32)
+    parser.add_argument("--stride", type=int, default=STRIDE, help="Raw-frame interval between policy windows (native horizon: 40)")
+    parser.add_argument("--context", type=int, help="Maximum policy contexts (default matches the span of 192 stride-8 contexts)")
+    parser.add_argument("--context-start", type=int, help="Initial policy contexts (default matches the span of 32 stride-8 contexts)")
     parser.add_argument("--context-warmup", type=int, default=10000)
     parser.add_argument("--segment", type=int, default=8)
     parser.add_argument("--vlm-batch", type=int, default=4)
@@ -233,6 +246,12 @@ def main():
     args = parser.parse_args()
     args.micro_batch = 1
     rank, world = int(os.getenv("RANK", "0")), int(os.getenv("WORLD_SIZE", "1"))
+    if args.stride < 1:
+        parser.error("--stride must be positive")
+    if args.context is None:
+        args.context = 191 * STRIDE // args.stride + 1
+    if args.context_start is None:
+        args.context_start = 31 * STRIDE // args.stride + 1
     positive = (args.steps, args.global_batch, args.context, args.context_start, args.segment,
                 args.vlm_batch, args.save_every, args.log_every)
     if min(positive) < 1 or min(args.warmup, args.context_warmup, args.seed) < 0:

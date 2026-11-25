@@ -18,11 +18,12 @@ PROCESSOR_REVISION = "89644892e4d85e24eaac8bacfd4f463576704203"
 HORIZON = 40
 STRIDE = 8
 CACHE_VERSION = 1
+CACHE_FIELDS = ("features", "vl_mask", "image_mask", "state", "actions", "action_mask", "embodiment_id")
 
 
-def cache_directory(root, data_sha256):
+def cache_directory(root, data_sha256, stride=STRIDE):
     identity = [CACHE_VERSION, BASE_REVISION, UPSTREAM_REVISION, PROCESSOR_REVISION,
-                HORIZON, STRIDE, data_sha256]
+                HORIZON, stride, data_sha256]
     return root / sha256(json.dumps(identity).encode()).hexdigest()[:24]
 
 
@@ -30,8 +31,8 @@ def cache_path(directory: Path, episode):
     return directory / f"{episode.level}-{episode.seed}-{episode.signature}.safetensors"
 
 
-def episode_chunks(episode):
-    return (episode.frames - HORIZON) // STRIDE + 1
+def episode_chunks(episode, stride=STRIDE):
+    return max(0, (episode.frames - HORIZON) // stride + 1)
 
 
 def load_processor(snapshot, assets, stats):
@@ -47,21 +48,70 @@ def load_processor(snapshot, assets, stats):
     return processor
 
 
-@torch.inference_mode()
-def build_cache(episodes, directory, snapshot, assets, stats, device, batch_size, on_episode):
-    from gr00t.data.types import MessageType
+def _write_cache(target, tensors):
     from safetensors.torch import save_file
 
+    temporary = target.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        save_file({name: value.contiguous() for name, value in tensors.items()}, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reuse_dense_episode(source, target, episode, stride):
+    from safetensors import safe_open
+
+    ratio = stride // STRIDE
+    expected = episode_chunks(episode)
+    with safe_open(source, framework="pt", device="cpu") as handle:
+        if set(handle.keys()) != set(CACHE_FIELDS):
+            raise ValueError(f"Unexpected tensor fields in the stride-{STRIDE} cache {source}")
+        tensors = {}
+        for name in CACHE_FIELDS:
+            tensor = handle.get_tensor(name)
+            if tensor.shape[0] != expected:
+                raise ValueError(f"Unexpected frame count for {name} in the stride-{STRIDE} cache {source}")
+            tensors[name] = tensor[::ratio].contiguous()
+        if tensors["features"].dtype != torch.bfloat16:
+            raise ValueError(f"Expected BF16 features in the stride-{STRIDE} cache {source}")
+        # Every selected observation and its entire H-step target begin at the
+        # same raw frame as a direct pass at the new stride.
+        if len(tensors["features"]) != episode_chunks(episode, stride):
+            raise ValueError(f"Subsampling {source} did not produce the expected cache length")
+        _write_cache(target, tensors)
+
+
+@torch.inference_mode()
+def build_cache(episodes, directory, snapshot, assets, stats, device, batch_size, on_episode, *,
+                stride=STRIDE, dense_cache=None):
+    if stride < 1 or (dense_cache is not None and (stride <= STRIDE or stride % STRIDE)):
+        raise ValueError(f"Stride must be positive, and reuse needs an integer multiple of {STRIDE}")
     directory.mkdir(parents=True, exist_ok=True)
     pending = [episode for episode in episodes if not cache_path(directory, episode).is_file()]
+    counts = {"existing": len(episodes) - len(pending), "reused": 0, "encoded": 0}
     if not pending:
-        return
+        return counts
+    uncached = []
+    for episode in pending:
+        source = cache_path(dense_cache, episode) if dense_cache is not None else None
+        if source is None or not source.is_file():
+            uncached.append(episode)
+            continue
+        _reuse_dense_episode(source, cache_path(directory, episode), episode, stride)
+        counts["reused"] += 1
+        on_episode(episode, counts["reused"], len(pending))
+    if not uncached:
+        return counts
+
+    from gr00t.data.types import MessageType
+
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     backbone = load_public_backbone(snapshot, assets, device=device, dtype=dtype)
     processor = load_processor(snapshot, assets, stats)
-    for index, episode in enumerate(pending, 1):
+    for episode in uncached:
         parts = {}
-        frame_ids = range(0, episode.frames - HORIZON + 1, STRIDE)
+        frame_ids = range(0, episode.frames - HORIZON + 1, stride)
         steps = read_marvin_steps(episode, frame_ids, HORIZON)
         while group := list(islice(steps, batch_size)):
             processed = [processor([{"type": MessageType.EPISODE_STEP.value, "content": sample}]) for sample in group]
@@ -83,14 +133,10 @@ def build_cache(episodes, directory, snapshot, assets, stats, device, batch_size
             }
             for name, value in fp.items():
                 parts.setdefault(name, []).append(value)
-        target = cache_path(directory, episode)
-        temporary = target.with_suffix(f".tmp.{os.getpid()}")
-        try:
-            save_file({name: torch.cat(values).contiguous() for name, values in parts.items()}, temporary)
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        on_episode(episode, index, len(pending))
+        _write_cache(cache_path(directory, episode), {name: torch.cat(values) for name, values in parts.items()})
+        counts["encoded"] += 1
+        on_episode(episode, counts["reused"] + counts["encoded"], len(pending))
+    return counts
 
 
 def read_cached_segment(directory, episode, start, end, device):

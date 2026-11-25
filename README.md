@@ -2,7 +2,7 @@
 
 本项目实现 RoboTTT 的快权重动作头、序列 flow matching、TBPTT 及仅作为上下文的轨迹片段。附带小型闭环任务、NPZ 训练输入、光模块插拔仿真演示转换器，以及接入公开 GR00T N1.7 动作头的接口。论文中未给出的配置及公开模型与论文骨干的差异见 [论文对照与复现假设](REPRODUCTION.md)。
 
-## XPolicyLab 与此前的六任务训练
+## XPolicyLab 与六任务训练
 
 仓库包含 [XPolicyLab RoboTTT 适配器](policy/RoboTTT/README.md)，支持天机仿真的 `marvin_dual_gripper` 和 `joint` 控制。通过标准 `ModelTemplate` 和 WebSocket 加载训练 checkpoint，三路 RGB 与 16 维关节/夹爪状态由各环境独立推进快权重。
 
@@ -11,7 +11,7 @@ bash setup_xpolicylab.sh /path/to/XPolicyLab
 ROBOTTT_DATA_ROOT=/path/to/benchmark_data bash cloud/run_dlc.sh check
 ```
 
-[阿里云 DLC 训练入口](cloud/README.md)使用一个节点上的 4 张 A100 或 4 张 A800。有效全局 batch 为 64 条轨迹序列，默认每卡 micro-batch 16，总计 50,000 个优化器步。训练读取 NAS 的 `/mnt/workspace/raw`，要求六个任务各有 50 条 HDF5 示范。官方测试种子独立于这 300 条训练轨迹。
+公开 GR00T N1.7 的 [阿里云 DLC 训练入口](cloud/README.md)使用一个节点上的四张 A100 或四张 A800。每卡累积 16 条轨迹，有效全局 batch 为 64，总计 50,000 个优化器步，每 10,000 步保存。训练从 NAS `/mnt/workspace/raw` 读取六个任务各 50 条 HDF5 示范，并切成每块 40 步的非重叠动作块。官方测试种子独立于这 300 条训练轨迹。
 
 此前的 DLC 训练使用本项目的小型 RoboTTT 动作头，保留 TTT-MLP、序列 flow matching 与 TBPTT。三相机图像用 RGB patch token，训练中逐步将上下文上限从 32 增至 192 个策略调用，每次预测 8 个 30 Hz 动作。任务文本用六个固定任务 ID 编码。公开 GR00T 的实权重验证见下表。
 

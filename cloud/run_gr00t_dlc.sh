@@ -46,8 +46,8 @@ PY
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
 case "$mode" in
-    smoke) settings=(--smoke --steps 1 --global-batch 4 --context 192 --context-start 192 --context-warmup 0 --save-every 1) ;;
-    train) settings=(--steps 50000 --global-batch 64 --save-every 10000) ;;
+    smoke) settings=(--smoke --steps 3 --global-batch 64 --context 39 --context-start 39 --context-warmup 0 --save-every 3) ;;
+    train) settings=(--steps 50000 --global-batch 64 --context 39 --context-start 7 --context-warmup 10000 --save-every 10000) ;;
 esac
 resume=()
 if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
@@ -55,4 +55,4 @@ if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
 fi
 exec "$python" -m torch.distributed.run --standalone --nproc-per-node=4 -m robottt.gr00t_train \
     --data "$data" --base "$base" --processor-assets "$processor" --cache "$cache" --output "$output" \
-    --require-a100-a800 "${settings[@]}" "${resume[@]}"
+    --require-a100-a800 --stride 40 --segment 8 "${settings[@]}" "${resume[@]}"

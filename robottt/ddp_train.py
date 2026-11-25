@@ -9,6 +9,8 @@ import json
 from math import cos, pi
 import os
 from pathlib import Path
+import re
+from socket import gethostname
 from time import perf_counter
 
 import numpy as np
@@ -57,8 +59,36 @@ def _sync():
         dist.barrier()
 
 
+def _local_required_gpu_worker(world, local_rank):
+    local_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world)))
+    names = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
+    models = [re.search(r"\bA(?:100|800)\b", name) for name in names]
+    if (world != 4 or local_size not in (2, 4) or not 0 <= local_rank < local_size
+            or len(names) != local_size or not all(models)
+            or any("MIG" in name.upper() for name in names)
+            or len({model.group() for model in models}) != 1):
+        raise RuntimeError(
+            "Expected four full A100 or A800 GPUs total, with two or four matching visible GPUs per node. "
+            f"Got {names}, world={world}, local_size={local_size}, local_rank={local_rank}"
+        )
+    return (os.getenv("GROUP_RANK") or gethostname(), local_size, local_rank, models[0].group())
+
+
+def _verify_required_gpu_workers(worker, world):
+    workers = [None] * world
+    dist.all_gather_object(workers, worker)
+    _, local_size, _, model = worker
+    nodes = {}
+    for node, _, local_rank, _ in workers:
+        nodes.setdefault(node, []).append(local_rank)
+    if ({(size, family) for _, size, _, family in workers} != {(local_size, model)}
+            or any(sorted(ranks) != list(range(local_size)) for ranks in nodes.values())):
+        raise RuntimeError(f"All ranks must use the same A100 or A800 family and fill each node's local slots: {workers}")
+
+
 def _device(args, world):
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    worker = None
     if args.device == "cpu" or (args.device == "auto" and not torch.cuda.is_available()):
         device = torch.device("cpu")
         if args.require_a100_a800:
@@ -68,15 +98,19 @@ def _device(args, world):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested, but PyTorch reports no CUDA")
         if args.require_a100_a800:
-            names = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
-            if world != 4 or len(names) != 4 or not (
-                all("A100" in name for name in names) or all("A800" in name for name in names)
-            ):
-                raise RuntimeError(f"Expected four visible A100s or four A800s and world size 4; got {names}, world={world}")
+            worker = _local_required_gpu_worker(world, local_rank)
         torch.cuda.set_device(device)
+        if worker is not None and not torch.cuda.is_bf16_supported(including_emulation=False):
+            raise RuntimeError(f"{worker[-1]} at local rank {local_rank} must support native BF16")
         torch.set_float32_matmul_precision("high")
     if world > 1:
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo", device_id=device if device.type == "cuda" else None)
+    if worker is not None:
+        try:
+            _verify_required_gpu_workers(worker, world)
+        except Exception:
+            dist.destroy_process_group()
+            raise
     return device
 
 

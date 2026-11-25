@@ -10,6 +10,20 @@ case "$mode" in
     *) echo "Usage: bash cloud/run_gr00t_dlc.sh {smoke|pilot|train}" >&2; exit 2 ;;
 esac
 
+nodes="${ROBOTTT_DLC_NODES:-1}"
+case "$nodes" in
+    1) gpus_per_node=4; rendezvous=(--standalone) ;;
+    2)
+        if [[ "${WORLD_SIZE:-}" != 2 || ! "${RANK:-}" =~ ^[01]$ || -z "${MASTER_ADDR:-}" || ! "${MASTER_PORT:-}" =~ ^[0-9]+$ ]]; then
+            echo "Two-node launch requires DLC's WORLD_SIZE=2, node RANK, MASTER_ADDR and MASTER_PORT" >&2
+            exit 2
+        fi
+        gpus_per_node=2
+        rendezvous=(--nnodes 2 --node-rank "$RANK" --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT")
+        ;;
+    *) echo "ROBOTTT_DLC_NODES must be 1 or 2" >&2; exit 2 ;;
+esac
+
 nas="${ROBOTTT_NAS_ROOT:-/mnt/workspace}"
 data="${ROBOTTT_DATA_ROOT:-$nas/raw}"
 assets="${ROBOTTT_ASSETS_ROOT:-$nas/robottt/assets}"
@@ -27,17 +41,19 @@ fi
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_ALBUMENTATIONS_UPDATE=1
 
-"$python" - <<'PY'
+"$python" - "$gpus_per_node" <<'PY'
 import re
+import sys
 
 import torch
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 
 names = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
 models = [re.search(r"(?<![A-Za-z0-9])A(?:100|800)(?![A-Za-z0-9])", name) for name in names]
-if (len(names) != 4 or not all(models) or len({match.group() for match in models}) != 1
+expected = int(sys.argv[1])
+if (len(names) != expected or not all(models) or len({match.group() for match in models}) != 1
         or any("MIG" in name.upper() for name in names) or not torch.cuda.is_bf16_supported()):
-    raise SystemExit(f"Expected 4 full, same-model NVIDIA A100s or A800s with BF16 support, got {names}")
+    raise SystemExit(f"Expected {expected} full, same-model NVIDIA A100s or A800s with BF16 support on this node, got {names}")
 
 print(f"Verified BF16 GPUs {names} and the NVIDIA processor import", flush=True)
 PY
@@ -58,6 +74,6 @@ resume=()
 if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
     resume=(--resume "$ROBOTTT_RESUME")
 fi
-exec "$python" -m torch.distributed.run --standalone --nproc-per-node=4 -m robottt.gr00t_train \
+exec "$python" -m torch.distributed.run "${rendezvous[@]}" --nproc-per-node "$gpus_per_node" -m robottt.gr00t_train \
     --data "$data" --base "$base" --processor-assets "$processor" --cache "$cache" --output "$output" \
     --require-a100-a800 --stride 40 --segment 8 "${settings[@]}" "${resume[@]}"

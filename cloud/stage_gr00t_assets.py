@@ -7,7 +7,7 @@ from http.client import HTTPException
 import os
 from pathlib import Path
 import shutil
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 BASE = (
@@ -40,6 +40,16 @@ SHARDS = {
 CHUNK = 16 * 1024 * 1024
 
 
+class PermanentRedirectHandler(HTTPRedirectHandler):
+    def http_error_308(self, request, response, code, message, headers):
+        # Some Python 3.10 builds omit 308 handling. For these public GETs,
+        # the temporary 307 handler has the same method and Range semantics.
+        return self.http_error_307(request, response, 307, message, headers)
+
+
+OPENER = build_opener(PermanentRedirectHandler())
+
+
 def git_blob(data):
     return sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
 
@@ -61,7 +71,7 @@ def request(url, headers, limit, content_range=None):
         separator = "&" if "?" in url else "?"
         req = Request(f"{url}{separator}stage_attempt={attempt}", headers=headers)
         try:
-            with urlopen(req, timeout=35) as response:
+            with OPENER.open(req, timeout=35) as response:
                 if content_range is not None and (
                     response.status != 206 or response.headers.get("Content-Range") != content_range
                 ):

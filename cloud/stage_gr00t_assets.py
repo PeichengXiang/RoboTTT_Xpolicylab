@@ -1,16 +1,16 @@
 """Stage and verify the immutable public GR00T N1.7 assets on NAS."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from email.parser import BytesHeaderParser
 from hashlib import sha1, sha256
+from itertools import islice
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 from tempfile import NamedTemporaryFile
-from urllib.parse import urlsplit
 
 
 BASE = (
@@ -43,6 +43,19 @@ SHARDS = {
 CHUNK = 16 * 1024 * 1024
 
 
+class AssetTransferError(RuntimeError):
+    """A transfer failure with a diagnostic safe to print."""
+
+
+def _transfer_failure(exc):
+    if isinstance(exc, AssetTransferError):
+        return str(exc)
+    if isinstance(exc, OSError) and exc.errno is not None:
+        return f"{type(exc).__name__} (errno {exc.errno})"
+    # An arbitrary exception may include a signed URL or server response.
+    return type(exc).__name__
+
+
 def git_blob(data):
     return sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
 
@@ -63,8 +76,9 @@ def _final_response(raw_headers):
     # curl records proxy CONNECT and redirected responses before the final one.
     for block in reversed(re.split(rb"\r?\n\r?\n", raw_headers)):
         status_line, _, fields = block.partition(b"\n")
-        if status_line.startswith(b"HTTP/"):
-            return int(status_line.split()[1]), BytesHeaderParser().parsebytes(fields)
+        status = re.match(rb"HTTP/\S+\s+([0-9]{3})(?:\s|$)", status_line)
+        if status:
+            return int(status.group(1)), BytesHeaderParser().parsebytes(fields)
     return None, None
 
 
@@ -85,12 +99,12 @@ def _curl_request(url, headers, limit, timeout):
             data = process.stdout.read(limit + 1)
             if len(data) > limit:
                 process.kill()
-                raise ValueError("Response exceeded the requested byte limit")
+                raise AssetTransferError("Response exceeded the requested byte limit")
             return_code = process.wait()
         response_headers.seek(0)
         status, response = _final_response(response_headers.read())
         if return_code:
-            raise OSError(f"curl exit {return_code}, final HTTP status {status}")
+            raise AssetTransferError(f"curl exit {return_code}, final HTTP status {status}")
         return status, response, data
 
 
@@ -104,18 +118,17 @@ def request(url, headers, limit, content_range=None):
                 f"{url}{separator}stage_attempt={attempt}", headers, limit, timeout,
             )
             if status != expected_status:
-                raise ValueError(f"Expected HTTP {expected_status}, received {status}")
+                raise AssetTransferError(f"Expected HTTP {expected_status}, received {status}")
             if content_range is not None:
                 if response.get_all("Content-Range") != [content_range]:
-                    raise ValueError("Unexpected HTTP Content-Range")
+                    raise AssetTransferError("Unexpected HTTP Content-Range")
                 if len(data) != limit:
-                    raise ValueError("Short HTTP byte range")
+                    raise AssetTransferError("Short HTTP byte range")
             return data
-        except (OSError, ValueError) as exc:
+        except (AssetTransferError, OSError, ValueError) as exc:
             if attempt == 4:
-                source = urlsplit(url)
-                raise RuntimeError(
-                    f"Public asset request failed: {source.hostname}{source.path} ({exc})"
+                raise AssetTransferError(
+                    f"Public asset request failed after {attempt + 1} attempts ({_transfer_failure(exc)})"
                 ) from None
 
 
@@ -127,7 +140,10 @@ def stage_metadata(directory, endpoint, snapshot, files):
         path = destination / name
         if not path.is_file():
             url = f"{endpoint}/{repo}/resolve/{revision}/{name}"
-            data = request(url, {}, limit=16 * 1024 * 1024)
+            try:
+                data = request(url, {}, limit=16 * 1024 * 1024)
+            except AssetTransferError as exc:
+                raise AssetTransferError(f"{relative}/{name}: {exc}") from None
             if git_blob(data) != expected:
                 raise ValueError(f"Git blob mismatch: {path}")
             temporary = path.with_suffix(f".tmp.{os.getpid()}")
@@ -145,7 +161,7 @@ def fetch_range(file, start, stop, size, url):
         content_range=f"bytes {start}-{stop - 1}/{size}",
     )
     if len(data) != stop - start or os.pwrite(file, data, start) != len(data):
-        raise OSError(f"Short asset chunk at offset {start}")
+        raise AssetTransferError("Short asset chunk write")
 
 
 def stage_shard(path, size, checksum, url, workers):
@@ -162,19 +178,48 @@ def stage_shard(path, size, checksum, url, workers):
         pending_offsets = [start for start in range(0, size, CHUNK) if not (marks / str(start)).exists()]
         completed = size - sum(min(CHUNK, size - start) for start in pending_offsets)
         print(f"{path.name}: resuming {completed:,}/{size:,} bytes", flush=True)
+        offsets = iter(pending_offsets)
+        failed_offsets = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(fetch_range, stream.fileno(), start, min(start + CHUNK, size), size, url): start
-                for start in pending_offsets
+                for start in islice(offsets, workers)
             }
-            for future in as_completed(futures):
-                future.result()
-                start = futures[future]
-                (marks / str(start)).touch()
-                completed += min(CHUNK, size - start)
-                if completed == size or completed // CHUNK % 8 == 0:
-                    print(f"{path.name}: {completed:,}/{size:,} bytes", flush=True)
-        os.fsync(stream.fileno())
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                succeeded = []
+                for future in done:
+                    start = futures.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        failed_offsets.append(start)
+                        end = min(start + CHUNK, size) - 1
+                        print(f"{path.name}: range {start}-{end} failed ({_transfer_failure(exc)})", flush=True)
+                    else:
+                        succeeded.append(start)
+                if succeeded:
+                    # Marker files are a resume promise. Flush the successful
+                    # data first, then record it even if another range failed.
+                    os.fsync(stream.fileno())
+                    for start in sorted(succeeded):
+                        (marks / str(start)).touch()
+                        completed += min(CHUNK, size - start)
+                        if completed == size or completed // CHUNK % 8 == 0:
+                            print(f"{path.name}: {completed:,}/{size:,} bytes", flush=True)
+                # Once a range exhausts its retries, settle only the active
+                # requests. Future invocations can resume the missing offsets.
+                if not failed_offsets:
+                    for start in islice(offsets, len(done)):
+                        future = executor.submit(
+                            fetch_range, stream.fileno(), start, min(start + CHUNK, size), size, url,
+                        )
+                        futures[future] = start
+        if failed_offsets:
+            raise AssetTransferError(
+                f"{path.name}: {len(failed_offsets)} range request(s) failed. "
+                f"Saved {completed:,}/{size:,} bytes. Run stage again to resume."
+            )
     try:
         verify_shard(part, size, checksum)
     except ValueError:

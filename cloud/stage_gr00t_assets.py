@@ -2,12 +2,15 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.parser import BytesHeaderParser
 from hashlib import sha1, sha256
-from http.client import HTTPException
 import os
 from pathlib import Path
+import re
 import shutil
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+import subprocess
+from tempfile import NamedTemporaryFile
+from urllib.parse import urlsplit
 
 
 BASE = (
@@ -40,16 +43,6 @@ SHARDS = {
 CHUNK = 16 * 1024 * 1024
 
 
-class PermanentRedirectHandler(HTTPRedirectHandler):
-    def http_error_308(self, request, response, code, message, headers):
-        # Some Python 3.10 builds omit 308 handling. For these public GETs,
-        # the temporary 307 handler has the same method and Range semantics.
-        return self.http_error_307(request, response, 307, message, headers)
-
-
-OPENER = build_opener(PermanentRedirectHandler())
-
-
 def git_blob(data):
     return sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
 
@@ -66,23 +59,64 @@ def verify_shard(path, size, checksum):
     print(f"Verified SHA-256 {path.name} {checksum}", flush=True)
 
 
+def _final_response(raw_headers):
+    # curl records proxy CONNECT and redirected responses before the final one.
+    for block in reversed(re.split(rb"\r?\n\r?\n", raw_headers)):
+        status_line, _, fields = block.partition(b"\n")
+        if status_line.startswith(b"HTTP/"):
+            return int(status_line.split()[1]), BytesHeaderParser().parsebytes(fields)
+    return None, None
+
+
+def _curl_request(url, headers, limit, timeout):
+    with NamedTemporaryFile(prefix="gr00t-http-") as response_headers:
+        command = [
+            "curl", "--disable", "--silent", "--fail", "--location", "--max-redirs", "10",
+            "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "20",
+            "--speed-limit", "1024", "--speed-time", "35", "--max-time", str(timeout),
+            "--max-filesize", str(limit), "--dump-header", response_headers.name, "--output", "-",
+        ]
+        for key, value in headers.items():
+            command.extend(("--header", f"{key}: {value}"))
+        command.extend(("--url", url))
+        # Keep redirected URLs and response bodies out of logs. Limit the pipe
+        # read in case the server omits Content-Length on older curl versions.
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            data = process.stdout.read(limit + 1)
+            if len(data) > limit:
+                process.kill()
+                raise ValueError("Response exceeded the requested byte limit")
+            return_code = process.wait()
+        response_headers.seek(0)
+        status, response = _final_response(response_headers.read())
+        if return_code:
+            raise OSError(f"curl exit {return_code}, final HTTP status {status}")
+        return status, response, data
+
+
 def request(url, headers, limit, content_range=None):
+    expected_status = 206 if content_range is not None else 200
+    timeout = 1800 if content_range is not None else 120
+    separator = "&" if "?" in url else "?"
     for attempt in range(5):
-        separator = "&" if "?" in url else "?"
-        req = Request(f"{url}{separator}stage_attempt={attempt}", headers=headers)
         try:
-            with OPENER.open(req, timeout=35) as response:
-                if content_range is not None and (
-                    response.status != 206 or response.headers.get("Content-Range") != content_range
-                ):
-                    raise ValueError("Unexpected HTTP byte range")
-                data = response.read(limit)
-                if content_range is not None and len(data) != limit:
+            status, response, data = _curl_request(
+                f"{url}{separator}stage_attempt={attempt}", headers, limit, timeout,
+            )
+            if status != expected_status:
+                raise ValueError(f"Expected HTTP {expected_status}, received {status}")
+            if content_range is not None:
+                if response.get_all("Content-Range") != [content_range]:
+                    raise ValueError("Unexpected HTTP Content-Range")
+                if len(data) != limit:
                     raise ValueError("Short HTTP byte range")
-                return data
-        except (OSError, HTTPException, ValueError) as exc:
+            return data
+        except (OSError, ValueError) as exc:
             if attempt == 4:
-                raise RuntimeError(f"Public asset request failed: {url.split('?')[0]} ({type(exc).__name__})") from None
+                source = urlsplit(url)
+                raise RuntimeError(
+                    f"Public asset request failed: {source.hostname}{source.path} ({exc})"
+                ) from None
 
 
 def stage_metadata(directory, endpoint, snapshot, files):
@@ -164,6 +198,8 @@ def main():
     if args.operation == "stage":
         import fcntl
 
+        if shutil.which("curl") is None:
+            parser.error("curl is required to stage public GR00T assets")
         args.directory.mkdir(parents=True, exist_ok=True)
         with (args.directory / ".stage.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

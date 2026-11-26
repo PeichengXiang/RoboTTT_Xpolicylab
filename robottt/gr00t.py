@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as checkpoint_activations, set_checkpoint_early_stop
 
 from .policy import RolloutState, corrupt_actions
 from .ttt import TTTMLP
@@ -35,8 +36,9 @@ def _checkpoint_tensors(checkpoint: Path, prefix: str):
 
 
 def load_public_backbone(checkpoint: str | Path, processor_assets: str | Path, *,
-                         device: str | torch.device = "cpu", dtype: torch.dtype | None = None):
-    """Restore the frozen native VLM from GR00T's own safetensors snapshot.
+                         device: str | torch.device = "cpu", dtype: torch.dtype | None = None,
+                         trainable: bool = False):
+    """Restore the native VLM from GR00T's own safetensors snapshot.
 
     Use the corresponding Cosmos-Reason2-2B config or a verified byte-identical
     public copy. The model parameters all come from the GR00T snapshot.
@@ -54,7 +56,14 @@ def load_public_backbone(checkpoint: str | Path, processor_assets: str | Path, *
             self.select_layer = select_layer
             while len(self.model.language_model.layers) > select_layer:
                 self.model.language_model.layers.pop(-1)
-            self.set_trainable_parameters(False, False, 0)
+            self.set_trainable_parameters(trainable, trainable, 0)
+
+        def posttrain_features(self, inputs):
+            # Match the exact hidden state selected by NVIDIA's Qwen3Backbone.
+            # A full sequence of vocabulary logits and an inference KV cache
+            # are both unused by the action loss.
+            return self.model(**inputs, output_hidden_states=True, use_cache=False,
+                              logits_to_keep=1).hidden_states[-1]
 
     checkpoint = Path(checkpoint)
     config = Gr00tN1d7Config.from_pretrained(checkpoint, local_files_only=True)
@@ -67,7 +76,7 @@ def load_public_backbone(checkpoint: str | Path, processor_assets: str | Path, *
     backbone.to(device=device, dtype=dtype)
     backbone._reset_rotary_inv_freq()
     backbone._apply_vision_patch_embed_channels_last()
-    return backbone.requires_grad_(False)
+    return backbone.requires_grad_(trainable)
 
 
 class Gr00tRoboTTT(nn.Module):
@@ -82,12 +91,15 @@ class Gr00tRoboTTT(nn.Module):
         self, action_head: nn.Module, *, registers: int = 16, ttt_heads: int = 32,
         gate_init: float = 0.001, embodiment_id: int | None = None,
         stabilize_fast_weights: bool = False,
+        reference_style: bool = False,
         ttt_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         if registers < 0 or ttt_heads < 1:
             raise ValueError("registers must be nonnegative and ttt_heads must be positive")
         self.head = action_head
+        self.backbone = None
+        self.checkpoint_posttrain = False
         self.default_embodiment_id = embodiment_id
         self.stabilize_fast_weights = stabilize_fast_weights
         width = action_head.model.inner_dim
@@ -100,7 +112,7 @@ class Gr00tRoboTTT(nn.Module):
         ))
         nn.init.normal_(self.registers, std=0.02)
         self.memories = nn.ModuleList(
-            TTTMLP(width, heads=ttt_heads, stabilize=stabilize_fast_weights).to(
+            TTTMLP(width, heads=ttt_heads, stabilize=stabilize_fast_weights, reference_style=reference_style).to(
                 device=weight.device, dtype=adapter_dtype,
             )
             for _ in action_head.model.transformer_blocks
@@ -139,19 +151,54 @@ class Gr00tRoboTTT(nn.Module):
         self._freeze_base = stage == "pretrain"
         self.head.requires_grad_(not self._freeze_base)
         self.head.train(self.training and not self._freeze_base)
+        if self.backbone is not None:
+            self.backbone.set_trainable_parameters(not self._freeze_base, not self._freeze_base, 0)
+            self.backbone.requires_grad_(not self._freeze_base).train(self.training and not self._freeze_base)
         return self
+
+    def enable_full_posttrain(self, backbone: nn.Module, *, checkpoint_activations: bool = True):
+        """Attach the official VLM and unfreeze the full observation-to-action policy."""
+        self.backbone = backbone
+        self.checkpoint_posttrain = checkpoint_activations
+        self.head.set_trainable_parameters(True, True, True)
+        return self.set_stage("posttrain")
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self._freeze_base:
             self.head.eval()
+            if self.backbone is not None:
+                self.backbone.eval()
         return self
 
+    def _encode_observations(self, frames, batch, steps):
+        if self.backbone is None or len(frames) != steps:
+            raise ValueError("Full post-training needs the official VLM and one processor batch per timestep")
+        features, vl_masks, image_masks = [], [], []
+        for frame in frames:
+            if frame["input_ids"].ndim != 2 or frame["input_ids"].shape[0] != batch:
+                raise ValueError("Each processor batch must have one token sequence per trajectory")
+            if self.training and self.checkpoint_posttrain:
+                # Transformers temporarily wraps decoder layers to collect the
+                # official hidden state. Complete recomputation restores those hooks.
+                with set_checkpoint_early_stop(False):
+                    feature = checkpoint_activations(self.backbone.posttrain_features, frame, use_reentrant=False)
+            else:
+                feature = self.backbone.posttrain_features(frame)
+            features.append(feature)
+            vl_masks.append(frame["attention_mask"].bool())
+            image_masks.append(frame["input_ids"] == self.backbone.model.config.image_token_id)
+        width = max(value.shape[1] for value in features)
+        features = [F.pad(value, (0, 0, 0, width - value.shape[1])) for value in features]
+        vl_masks = [F.pad(value, (0, width - value.shape[1])) for value in vl_masks]
+        image_masks = [F.pad(value, (0, width - value.shape[1])) for value in image_masks]
+        return torch.stack(features, 1), torch.stack(vl_masks, 1), torch.stack(image_masks, 1)
+
     def forward(
-        self, context: Tensor, proprio: Tensor, noised_action: Tensor, tau: Tensor,
+        self, context: Tensor | None, proprio: Tensor, noised_action: Tensor, tau: Tensor,
         state: RolloutState | None = None, valid: Tensor | None = None, *,
         embodiment_id: Tensor | None = None, vl_mask: Tensor | None = None,
-        image_mask: Tensor | None = None, action_mask: Tensor | None = None,
+        image_mask: Tensor | None = None, action_mask: Tensor | None = None, raw_vl_inputs=None,
     ):
         """Return the flow velocity [B,T,H,A] and one fast-weight state per DiT block.
 
@@ -161,6 +208,12 @@ class Gr00tRoboTTT(nn.Module):
         has shape [B,T,H,A] (or last dimension 1). valid masks padded timesteps.
         """
         head, config = self.head, self.head.config
+        if raw_vl_inputs is not None:
+            if context is not None or vl_mask is not None or image_mask is not None:
+                raise ValueError("Raw VLM inputs provide their own context and masks")
+            context, vl_mask, image_mask = self._encode_observations(raw_vl_inputs, *noised_action.shape[:2])
+        elif context is None or (self.backbone is not None and self.training and not self._freeze_base):
+            raise ValueError("Full post-training must encode the current raw observations")
         model_dtype = next(head.parameters()).dtype
         context = context.to(dtype=model_dtype)
         proprio = proprio.to(dtype=model_dtype)
@@ -219,9 +272,12 @@ class Gr00tRoboTTT(nn.Module):
             raise ValueError("action_mask is required by this head's strict_action_padding_mask")
 
         strict_action_mask = action_mask if config.strict_action_padding_mask else None
-        backbone = head.process_backbone_output(
-            {"backbone_features": context.flatten(0, 1), "backbone_attention_mask": vl_mask}
-        )["backbone_features"].contiguous()
+        checkpoint_blocks = self.training and self.checkpoint_posttrain and torch.is_grad_enabled()
+        if checkpoint_blocks:
+            backbone = checkpoint_activations(self._project_context, context.flatten(0, 1), vl_mask,
+                                              use_reentrant=False)
+        else:
+            backbone = self._project_context(context.flatten(0, 1), vl_mask)
         state_tokens = head.state_encoder(proprio.reshape(batch * steps, 1, -1), ids)
         if head.training and head.state_dropout_prob > 0:
             keep = torch.rand(batch * steps, device=state_tokens.device) >= head.state_dropout_prob
@@ -262,17 +318,13 @@ class Gr00tRoboTTT(nn.Module):
                 source = backbone
                 mask = vl_mask if config.strict_vl_padding_mask else None
 
-            after_attention = self._apply_attention(block, tokens, source, mask, temb)
-            if hidden_mask is not None:
-                after_attention = after_attention * hidden_mask.unsqueeze(-1)
-            sequence = after_attention.unflatten(0, (batch, steps))
-            recalled, updated = memory(sequence, fast, valid=memory_valid, start_step=state.index)
+            block_args = (block, memory, tokens, source, mask, temb, hidden_mask, memory_valid,
+                          fast, gate, batch, steps, state.index)
+            if checkpoint_blocks:
+                tokens, updated = checkpoint_activations(self._apply_ttt_block, *block_args, use_reentrant=False)
+            else:
+                tokens, updated = self._apply_ttt_block(*block_args)
             fast_states.append(updated)
-            gate = gate.tanh().to(after_attention.dtype)
-            tokens = after_attention + recalled.flatten(0, 1).to(after_attention.dtype) * gate
-            tokens = tokens + block.ff(block.norm3(tokens))
-            if hidden_mask is not None:
-                tokens = tokens * hidden_mask.unsqueeze(-1)
 
         shift, scale = dit.proj_out_1(F.silu(temb)).chunk(2, dim=-1)
         tokens = dit.norm_out(tokens) * (1 + scale[:, None]) + shift[:, None]
@@ -282,6 +334,24 @@ class Gr00tRoboTTT(nn.Module):
         return velocity.unflatten(0, (batch, steps)), RolloutState(
             tuple(fast_states), state.index + steps,
         )
+
+    def _project_context(self, context, mask):
+        return self.head.process_backbone_output(
+            {"backbone_features": context, "backbone_attention_mask": mask}
+        )["backbone_features"].contiguous()
+
+    def _apply_ttt_block(self, block, memory, tokens, source, mask, temb, hidden_mask, memory_valid,
+                         fast, gate, batch, steps, start_step):
+        after_attention = self._apply_attention(block, tokens, source, mask, temb)
+        if hidden_mask is not None:
+            after_attention = after_attention * hidden_mask.unsqueeze(-1)
+        sequence = after_attention.unflatten(0, (batch, steps))
+        recalled, updated = memory(sequence, fast, valid=memory_valid, start_step=start_step)
+        tokens = after_attention + recalled.flatten(0, 1).to(after_attention.dtype) * gate.tanh().to(after_attention.dtype)
+        tokens = tokens + block.ff(block.norm3(tokens))
+        if hidden_mask is not None:
+            tokens = tokens * hidden_mask.unsqueeze(-1)
+        return tokens, updated
 
     @staticmethod
     def _apply_attention(block, tokens, source, mask, temb):

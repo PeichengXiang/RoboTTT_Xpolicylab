@@ -25,9 +25,12 @@ class TTTMLP(nn.Module):
     The paper specifies a two-layer GELU MLP and base rate 0.1. This implementation
     uses independent heads, 4x hidden expansion, one learned rate per head
     (2 × base × sigmoid), and RoPE on Q/K at absolute flattened token positions.
+    The optional reference style applies RMSNorm before Q/K/V projection and
+    shares the absolute chunk position across all tokens within a timestep.
     """
 
-    def __init__(self, width, heads=4, expansion=4, base_lr=0.1, rope_theta=10_000, *, stabilize=False):
+    def __init__(self, width, heads=4, expansion=4, base_lr=0.1, rope_theta=10_000, *,
+                 stabilize=False, reference_style=False):
         super().__init__()
         if min(width, heads, expansion, base_lr, rope_theta) <= 0 or width % (heads * 2):
             raise ValueError("Expected positive dimensions, rates and even head width")
@@ -38,6 +41,7 @@ class TTTMLP(nn.Module):
         self.stabilize = stabilize
         head_width = self.head_dim
         hidden_width = head_width * expansion
+        self.input_norm = nn.RMSNorm(width) if reference_style else None
         self.qkv = nn.Linear(width, 3 * width)
         self.output = nn.Linear(width, width)
         self.w1 = nn.Parameter(torch.randn(heads, head_width, hidden_width) / sqrt(head_width))
@@ -72,6 +76,8 @@ class TTTMLP(nn.Module):
         # the TTT adapter use different storage dtypes. Outer AMP still controls
         # projection arithmetic, and the recurrence below uses the carry dtype.
         tokens = tokens.to(dtype=self.qkv.weight.dtype).masked_fill(~valid.unsqueeze(-1), 0)
+        if self.input_norm is not None:
+            tokens = self.input_norm(tokens)
         projected = self.qkv(tokens)
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             memory, state = self._recur(projected.to(state.w1.dtype), state, valid, update, start_step)
@@ -93,8 +99,10 @@ class TTTMLP(nn.Module):
         rates = self.rope_theta ** (
             -torch.arange(0, self.head_dim, 2, device=projected.device, dtype=projected.dtype) / self.head_dim
         )
-        positions = torch.arange(start_step * count, (start_step + steps) * count, device=projected.device)
-        angles = (positions[:, None] * rates).unflatten(0, (steps, count))[:, None, None]
+        positions_per_step = 1 if self.input_norm is not None else count
+        positions = torch.arange(start_step * positions_per_step, (start_step + steps) * positions_per_step,
+                                 device=projected.device)
+        angles = (positions[:, None] * rates).unflatten(0, (steps, positions_per_step))[:, None, None]
         cosine, sine = angles.cos().to(query.dtype), angles.sin().to(query.dtype)
         query = self._rotate(query, cosine, sine)
         key = self._rotate(key, cosine, sine)

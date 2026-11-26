@@ -60,15 +60,17 @@ def _sync():
 
 
 def _local_required_gpu_worker(world, local_rank):
+    expected_world = int(os.getenv("ROBOTTT_DLC_GPUS", "4"))
     local_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world)))
     names = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
     models = [re.search(r"\bA(?:100|800)\b", name) for name in names]
-    if (world != 4 or local_size not in (2, 4) or not 0 <= local_rank < local_size
+    if (expected_world not in (4, 8) or world != expected_world
+            or local_size not in (world, world // 2) or not 0 <= local_rank < local_size
             or len(names) != local_size or not all(models)
             or any("MIG" in name.upper() for name in names)
             or len({model.group() for model in models}) != 1):
         raise RuntimeError(
-            "Expected four full A100 or A800 GPUs total, with two or four matching visible GPUs per node. "
+            f"Expected {expected_world} full A100 or A800 GPUs on one or two equal-size nodes. "
             f"Got {names}, world={world}, local_size={local_size}, local_rank={local_rank}"
         )
     return (os.getenv("GROUP_RANK") or gethostname(), local_size, local_rank, models[0].group())
@@ -92,7 +94,7 @@ def _device(args, world):
     if args.device == "cpu" or (args.device == "auto" and not torch.cuda.is_available()):
         device = torch.device("cpu")
         if args.require_a100_a800:
-            raise RuntimeError("This training run requires exactly 4 NVIDIA A100 or A800 GPUs")
+            raise RuntimeError("This training run requires NVIDIA A100 or A800 GPUs")
     else:
         device = torch.device("cuda", local_rank)
         if not torch.cuda.is_available():

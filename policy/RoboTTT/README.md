@@ -55,6 +55,13 @@ Set `reset_memory_each_chunk: true` in `deploy.yml` for the same-checkpoint hist
 
 ## Native GR00T N1.7 backbone
 
+Train the two-stage native policy through the XPolicyLab entry point on a single eligible four-card host:
+
+```bash
+ROBOTTT_BACKEND=gr00t_n1_7 ROBOTTT_RECIPE=paper_two_stage ROBOTTT_TTT_VARIANT=reference \
+  bash train.sh InsertBenchmark paper50k marvin_dual_gripper joint 1745 0,1,2,3
+```
+
 Select `backend: gr00t_n1_7` in `deploy.yml` or set `ROBOTTT_BACKEND=gr00t_n1_7`. Use an environment with the [official Isaac-GR00T N1.7 dependencies](https://github.com/NVIDIA/Isaac-GR00T/tree/708617f5716c63fc0a327391492ea2b91977ae90). The official base snapshot and a local Cosmos-compatible processor directory are required. For the public snapshot, the VLM is Cosmos-Reason2-2B and the action head has 32 DiT blocks. The adapter keeps the official VLM and action head and adds the 32 RoboTTT memories. It forwards the three RGB cameras and the benchmark's original language instruction through the native processor. Native `decode_action` restores the 16 absolute joint and gripper commands from normalized model output.
 
 For a trained native checkpoint:
@@ -70,7 +77,7 @@ EVAL_ENV_TYPE=debug DEBUG_OBS_ENCODED=1 DEBUG_EVAL_EPISODES=1 bash eval.sh \
   marvin_dual_gripper joint 0 0 0 /path/to/python-env /path/to/python-env
 ```
 
-A trained `latest.pt` must declare `backend: gr00t_n1_7`, a positive optimizer `step`, `adapter_config`, `adapter` tensors, and the training-time `marvin_statistics`. The adapter can load TTT-only updates or TTT plus the native Marvin state encoder, action encoder, and action decoder when the checkpoint declares `tune_marvin_projectors`. Its 40-action model horizon stays fixed. It executes eight actions and carries the fast weights to the next observation. Set `execution_horizon` only to test a deliberate change in the action execution stride.
+A trained `latest.pt` records the native backend, optimizer step, adapter configuration, learned tensors and Marvin normalization statistics. Stage-one checkpoints restore TTT, register tokens and gates. Legacy adaptation checkpoints may also include Marvin projectors. A `model_stage=posttrain` checkpoint restores the entire trained VLM and action head as well as TTT. Optimizer shards are used for training resume. The deployment service reads the single weight file and uses its saved execution stride. The non-overlapping training recipe predicts and executes 40 actions per policy call, then passes the updated fast weights to the next observation.
 
 To test integration with newly initialized TTT parameters, set `ROBOTTT_ALLOW_UNTRAINED_TTT=1`, set `ROBOTTT_GR00T_PROCESSOR`, and pass the official base snapshot directory as `ckpt_name`. The backend can compute Marvin normalization statistics from the 300 local benchmark demos or load the same statistics from `ROBOTTT_GR00T_STATISTICS`. This option does not load trained RoboTTT weights.
 

@@ -13,7 +13,7 @@ from robottt.raw_data import scan_episodes
 
 
 PROJECTORS = ("head.state_encoder.", "head.action_encoder.", "head.action_decoder.")
-TTT_CONFIG_FIELDS = ("registers", "ttt_heads", "gate_init", "stabilize_fast_weights")
+TTT_CONFIG_FIELDS = ("registers", "ttt_heads", "gate_init", "stabilize_fast_weights", "reference_style")
 VL_INPUT_KEYS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
 
 
@@ -42,11 +42,16 @@ def _load_adapter(policy, saved):
     if type(saved.get("step")) is not int or saved["step"] < 1:
         raise ValueError("Native trained GR00T checkpoint must record a positive optimizer step")
     tune_projectors = _tunes_projectors(saved)
-    expected = {
-        name
-        for name in policy.state_dict()
-        if not name.startswith("head.") or (tune_projectors and name.startswith(PROJECTORS))
-    }
+    if saved.get("model_stage") == "posttrain":
+        if policy.backbone is None:
+            raise ValueError("Full post-training checkpoint requires the native VLM and complete action head")
+        expected = {name for name, _ in policy.named_parameters()}
+    else:
+        expected = {
+            name
+            for name in policy.state_dict()
+            if not name.startswith(("head.", "backbone.")) or (tune_projectors and name.startswith(PROJECTORS))
+        }
     missing, unexpected = expected - adapter.keys(), adapter.keys() - expected
     if missing or unexpected:
         raise ValueError(f"GR00T adapter checkpoint key mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
@@ -134,10 +139,13 @@ class Gr00tMarvin:
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(seed)
             self.policy = Gr00tRoboTTT(head, **adapter_options)
+        full_posttrain = saved is not None and saved.get("model_stage") == "posttrain"
+        self.backbone = load_public_backbone(official_base, processor_assets, device=device, dtype=self.dtype)
+        if full_posttrain:
+            self.policy.enable_full_posttrain(self.backbone, checkpoint_activations=False)
         if saved is not None:
             _load_adapter(self.policy, saved)
         self.policy.to(device=device).eval()
-        self.backbone = load_public_backbone(official_base, processor_assets, device=device, dtype=self.dtype)
         print(
             f"[RoboTTT] official GR00T N1.7 {official_base} on {device}, {status}; "
             f"predict {self.horizon}, execute {self.execution_horizon}",

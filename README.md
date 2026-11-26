@@ -118,7 +118,7 @@ velocity, carry = policy(
 carry = carry.detach()  # TBPTT 段边界
 ```
 
-`features[B,T,V,D]` 来自上游 backbone 输出的 `backbone_features`；另外传入 `backbone_attention_mask` 和 `image_mask`。本体状态、action horizon、动作通道和补位掩码以相应 GR00T processor 配置为准。推理用 `policy.eval().sample`，单次调用移除上述输入的 T 维；返回动作块和下一状态。`set_stage("pretrain")` 冻结原动作头，`set_stage("posttrain")` 解冻原动作头。上面的缓存特征用法仅微调动作头，全 VLM 后训练需要额外接入 VLM 训练。
+`features[B,T,V,D]` 来自上游 backbone 输出的 `backbone_features`，同时传入 `backbone_attention_mask` 和 `image_mask`。推理用 `policy.eval().sample` 返回动作块和下一状态。全参数后训练通过 `enable_full_posttrain` 接入官方 VLM，传入原图经官方处理器生成的 `raw_vl_inputs`。DLC 上设置 `ROBOTTT_RECIPE=paper_two_stage ROBOTTT_TTT_VARIANT=reference` 后运行 `bash cloud/run_gr00t_dlc.sh train`，脚本在第 30,000 步自动切换阶段。数据、上下文、检查点与论文差异见[复现说明](REPRODUCTION.md)。
 
 `robottt.gr00t_insert` 将 Insert Benchmark 的 HDF5 示范读为官方 `VLAStepData`。使用 `marvin_modalities(40)` 注册 `NEW_EMBODIMENT`，使用 `marvin_statistics(train_episodes)` 为训练集计算归一化统计。`read_marvin_step` 保留三路 RGB、轨迹中的任务指令，以及按同一控制步对齐的 16 维绝对关节目标。官方 processor 将动作块从 `40 × 16` 补齐为 `40 × 132`，训练损失应使用其 `action_mask`。Marvin 使用新本体的投影槽，需要在此本体数据上训练才能评估任务成功率。
 

@@ -1,10 +1,10 @@
-"""Prepare frozen GR00T visual-language features from real demonstrations."""
+"""Read normalized Marvin targets, frozen features or raw GR00T vision inputs."""
 
 from hashlib import sha256
 from itertools import islice
 import json
-import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import torch
 
@@ -19,6 +19,8 @@ HORIZON = 40
 STRIDE = 8
 CACHE_VERSION = 1
 CACHE_FIELDS = ("features", "vl_mask", "image_mask", "state", "actions", "action_mask", "embodiment_id")
+SUPERVISION_FIELDS = ("state", "actions", "action_mask", "embodiment_id")
+VL_INPUT_FIELDS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
 
 
 def cache_directory(root, data_sha256, stride=STRIDE):
@@ -51,7 +53,8 @@ def load_processor(snapshot, assets, stats):
 def _write_cache(target, tensors):
     from safetensors.torch import save_file
 
-    temporary = target.with_suffix(f".tmp.{os.getpid()}")
+    with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False) as tmp:
+        temporary = Path(tmp.name)
     try:
         save_file({name: value.contiguous() for name, value in tensors.items()}, temporary)
         temporary.replace(target)
@@ -117,7 +120,7 @@ def build_cache(episodes, directory, snapshot, assets, stats, device, batch_size
             processed = [processor([{"type": MessageType.EPISODE_STEP.value, "content": sample}]) for sample in group]
             batch = processor.collator(processed)["inputs"]
             inputs = {key: batch[key].to(device=device, dtype=dtype if key == "pixel_values" else None)
-                      for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
+                      for key in VL_INPUT_FIELDS}
             result = backbone(backbone.prepare_input(inputs))
             features = result["backbone_features"]
             if not torch.isfinite(features).all():
@@ -139,9 +142,75 @@ def build_cache(episodes, directory, snapshot, assets, stats, device, batch_size
     return counts
 
 
-def read_cached_segment(directory, episode, start, end, device):
+def read_cached_segment(directory, episode, start, end, device, *, fields=CACHE_FIELDS):
     from safetensors import safe_open
 
     with safe_open(cache_path(directory, episode), framework="pt", device="cpu") as handle:
         return {name: handle.get_slice(name)[start:end].unsqueeze(0).to(device)
-                for name in handle.keys()}
+                for name in fields}
+
+
+def _raw_cache_path(directory, episode, stride, dtype):
+    if dtype not in (torch.bfloat16, torch.float32) or stride < 1:
+        raise ValueError("Official processor input cache requires a positive stride and BF16 or FP32 pixels")
+    # The parent is already keyed by data, processor/model revisions and horizon.
+    return cache_path(directory / f"processor-inputs-v1-s{stride}-{dtype}", episode)
+
+
+def _prepare_raw_episode(target, episode, processor, stride, dtype):
+    from gr00t.data.types import MessageType
+
+    if processor.training:
+        raise ValueError("Pixel caching requires the deterministic eval-mode GR00T processor")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame_indices = range(0, episode.frames - HORIZON + 1, stride)
+    shared = {}
+    pixels = None
+    for index, sample in enumerate(read_marvin_steps(episode, frame_indices, HORIZON)):
+        item = processor([{"type": MessageType.EPISODE_STEP.value, "content": sample}])
+        inputs = processor.collator([item])["inputs"]
+        patches = inputs["pixel_values"]
+        metadata = {key: inputs[key] for key in VL_INPUT_FIELDS if key != "pixel_values"}
+        if pixels is None:
+            shared = metadata
+            pixels = torch.empty((len(frame_indices), *patches.shape), dtype=dtype)
+        elif (patches.shape != pixels.shape[1:] or
+              any(not torch.equal(value, shared[key]) for key, value in metadata.items())):
+            raise ValueError(f"Processor token or image layout changed in {episode.path} at frame {frame_indices[index]}")
+        pixels[index].copy_(patches)
+    if pixels is None:
+        raise ValueError(f"Episode has no complete action chunks: {episode.path}")
+    _write_cache(target, {**shared, "pixel_values": pixels})
+
+
+def build_raw_cache(episodes, directory, processor, *, stride, dtype=torch.bfloat16, on_episode=None):
+    """Preprocess original RGBs once on CPU for a trainable VLM. No model is loaded."""
+    counts = {"existing": 0, "encoded": 0}
+    for index, episode in enumerate(episodes, 1):
+        target = _raw_cache_path(directory, episode, stride, dtype)
+        if target.is_file():
+            counts["existing"] += 1
+            continue
+        _prepare_raw_episode(target, episode, processor, stride, dtype)
+        counts["encoded"] += 1
+        if on_episode is not None:
+            on_episode(episode, index, len(episodes))
+    return counts
+
+
+def read_raw_segment(directory, episode, start, end, device, *, stride, processor):
+    """Load supervision and one official VLM input per chronological policy call."""
+    from safetensors import safe_open
+
+    if stride < 1 or not 0 <= start < end <= episode_chunks(episode, stride):
+        raise ValueError(f"Invalid raw policy segment [{start}, {end}) at stride {stride} in {episode.path}")
+    batch = read_cached_segment(directory, episode, start, end, device, fields=SUPERVISION_FIELDS)
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    path = _raw_cache_path(directory, episode, stride, dtype)
+    if not path.is_file():
+        _prepare_raw_episode(path, episode, processor, stride, dtype)
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        fixed = {key: handle.get_tensor(key).to(device) for key in VL_INPUT_FIELDS if key != "pixel_values"}
+        pixels = handle.get_slice("pixel_values")[start:end].to(device)
+    batch["vl_inputs"] = [{**fixed, "pixel_values": frame} for frame in pixels.unbind(0)]
+    return batch

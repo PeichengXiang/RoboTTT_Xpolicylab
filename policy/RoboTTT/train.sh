@@ -33,6 +33,19 @@ print(build_run_dir_name(dict(zip(keys, sys.argv[1:], strict=True))))
 PY
 )"
 
+if [[ "${ROBOTTT_RECIPE:-}" == paper_two_stage || "${ROBOTTT_BACKEND:-}" == gr00t_n1_7 ]]; then
+    output="${ROBOTTT_RUN_DIR:-${SCRIPT_DIR}/checkpoints/${run_name}}"
+    export ROBOTTT_DLC_GPUS="${#gpus[@]}"
+    assets="${ROBOTTT_ASSETS_ROOT:-/mnt/workspace/robottt/assets}"
+    exec bash "$SCRIPT_DIR/train_gr00t_stages.sh" train "$output" \
+        "${ROBOTTT_PYTHON:-python}" -m torch.distributed.run --standalone --nproc-per-node "${#gpus[@]}" \
+        -m robottt.gr00t_train --base "${ROBOTTT_GR00T_BASE:-$assets/gr00t-n1.7-3b-373d34e}" \
+        --processor-assets "${ROBOTTT_GR00T_PROCESSOR:-$assets/qwen3-vl-2b-processor-8964489}" \
+        --data "${ROBOTTT_DATA:-/mnt/workspace/raw}" --cache "${ROBOTTT_GR00T_CACHE:-/mnt/workspace/robottt/cache/gr00t}" \
+        --output "$output" --seed "$seed" --global-batch 64 --stride 40 --segment 8 \
+        --ttt-variant "${ROBOTTT_TTT_VARIANT:-reference}" --require-a100-a800
+fi
+
 exec python -m torch.distributed.run --standalone --nproc_per_node="${#gpus[@]}" -m robottt.ddp_train \
     --data "${ROBOTTT_DATA:-/mnt/workspace/raw}" --output "${SCRIPT_DIR}/checkpoints/${run_name}" \
     --seed "${seed}" --steps "${ROBOTTT_STEPS:-50000}" --global-batch "${ROBOTTT_GLOBAL_BATCH:-64}"

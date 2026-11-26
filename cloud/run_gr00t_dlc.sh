@@ -6,8 +6,8 @@ cd "$repo_dir"
 
 mode="${1:-}"
 case "$mode" in
-    smoke|pilot|train) ;;
-    *) echo "Usage: bash cloud/run_gr00t_dlc.sh {smoke|pilot|train}" >&2; exit 2 ;;
+    smoke|pilot|train|benchmark) ;;
+    *) echo "Usage: bash cloud/run_gr00t_dlc.sh {smoke|pilot|train|benchmark}" >&2; exit 2 ;;
 esac
 
 nodes="${ROBOTTT_DLC_NODES:-1}"
@@ -71,7 +71,11 @@ PY
 "$python" cloud/stage_gr00t_assets.py verify "$assets"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
-launch=("$python" -m torch.distributed.run "${rendezvous[@]}" --nproc-per-node "$gpus_per_node" -m robottt.gr00t_train
+torchrun=("$python" -m torch.distributed.run "${rendezvous[@]}" --nproc-per-node "$gpus_per_node" -m)
+if [[ "$mode" == benchmark ]]; then
+    exec "${torchrun[@]}" cloud.benchmark_gr00t_batch --data "$data" --base "$base" --cache "$cache" --output "$output"
+fi
+launch=("${torchrun[@]}" robottt.gr00t_train
         --data "$data" --base "$base" --processor-assets "$processor" --cache "$cache" --output "$output"
         --require-a100-a800 --ttt-variant "$variant" --stride 40 --segment 8 --global-batch 64)
 recipe="${ROBOTTT_RECIPE:-adapter}"

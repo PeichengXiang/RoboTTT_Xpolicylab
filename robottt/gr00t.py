@@ -199,6 +199,7 @@ class Gr00tRoboTTT(nn.Module):
         state: RolloutState | None = None, valid: Tensor | None = None, *,
         embodiment_id: Tensor | None = None, vl_mask: Tensor | None = None,
         image_mask: Tensor | None = None, action_mask: Tensor | None = None, raw_vl_inputs=None,
+        vl_lengths: tuple[int, ...] | None = None,
     ):
         """Return the flow velocity [B,T,H,A] and one fast-weight state per DiT block.
 
@@ -206,10 +207,11 @@ class Gr00tRoboTTT(nn.Module):
         observations, or [B,T,P] if S is one. Per-VL-token masks are [B,T,V].
         Embodiment IDs are [B] or [B,T]. A regular GR00T action padding mask
         has shape [B,T,H,A] (or last dimension 1). valid masks padded timesteps.
+        vl_lengths records the original visual-language width of each padded trajectory.
         """
         head, config = self.head, self.head.config
         if raw_vl_inputs is not None:
-            if context is not None or vl_mask is not None or image_mask is not None:
+            if context is not None or vl_mask is not None or image_mask is not None or vl_lengths is not None:
                 raise ValueError("Raw VLM inputs provide their own context and masks")
             context, vl_mask, image_mask = self._encode_observations(raw_vl_inputs, *noised_action.shape[:2])
         elif context is None or (self.backbone is not None and self.training and not self._freeze_base):
@@ -219,6 +221,11 @@ class Gr00tRoboTTT(nn.Module):
         proprio = proprio.to(dtype=model_dtype)
         noised_action = noised_action.to(dtype=model_dtype)
         batch, steps, vl_tokens, _ = context.shape
+        if vl_lengths is not None:
+            if len(vl_lengths) != batch or min(vl_lengths) < 1 or max(vl_lengths) != vl_tokens:
+                raise ValueError("vl_lengths must match the trajectories and padded token width")
+            if min(vl_lengths) == vl_tokens:
+                vl_lengths = None
         horizon, action_width = noised_action.shape[-2:]
         if proprio.ndim == 3:
             proprio = proprio.unsqueeze(2)
@@ -255,6 +262,12 @@ class Gr00tRoboTTT(nn.Module):
         if vl_mask.shape != vl_shape:
             raise ValueError("vl_mask must have shape [B,T,V]")
         vl_mask = vl_mask.flatten(0, 1).to(device=context.device, dtype=torch.bool)
+        cross_padding = None
+        if vl_lengths is not None:
+            widths = torch.tensor(vl_lengths, device=context.device)
+            original_tokens = torch.arange(vl_tokens, device=context.device) < widths[:, None]
+            cross_padding = original_tokens.repeat_interleave(steps, dim=0)
+            vl_mask = vl_mask & cross_padding
         if config.use_alternate_vl_dit:
             if image_mask is None or image_mask.shape != vl_shape:
                 raise ValueError("public AlternateVLDiT requires image_mask with shape [B,T,V]")
@@ -273,7 +286,9 @@ class Gr00tRoboTTT(nn.Module):
 
         strict_action_mask = action_mask if config.strict_action_padding_mask else None
         checkpoint_blocks = self.training and self.checkpoint_posttrain and torch.is_grad_enabled()
-        if checkpoint_blocks:
+        if vl_lengths is not None:
+            backbone = self._project_variable_widths(context, vl_mask, vl_lengths)
+        elif checkpoint_blocks:
             backbone = checkpoint_activations(self._project_context, context.flatten(0, 1), vl_mask,
                                               use_reentrant=False)
         else:
@@ -316,7 +331,7 @@ class Gr00tRoboTTT(nn.Module):
                 mask = text_attention_mask if text_layer else image_attention_mask
             else:
                 source = backbone
-                mask = vl_mask if config.strict_vl_padding_mask else None
+                mask = vl_mask if config.strict_vl_padding_mask else cross_padding
 
             block_args = (block, memory, tokens, source, mask, temb, hidden_mask, memory_valid,
                           fast, gate, batch, steps, state.index)
@@ -339,6 +354,23 @@ class Gr00tRoboTTT(nn.Module):
         return self.head.process_backbone_output(
             {"backbone_features": context, "backbone_attention_mask": mask}
         )["backbone_features"].contiguous()
+
+    def _project_variable_widths(self, context, mask, widths):
+        # The public head's visual self-attention can ignore its input mask.
+        # Project at each original width, then pad the cross-attention sources.
+        batch, steps, padded_width, _ = context.shape
+        mask = mask.unflatten(0, (batch, steps))
+        by_width = defaultdict(list)
+        for lane, width in enumerate(widths):
+            by_width[width].append(lane)
+        projected = [None] * batch
+        for width, lanes in by_width.items():
+            values = self._project_context(context[lanes, :, :width].flatten(0, 1),
+                                           mask[lanes, :, :width].flatten(0, 1))
+            values = F.pad(values, (0, 0, 0, padded_width - width)).unflatten(0, (len(lanes), steps))
+            for lane, value in zip(lanes, values.unbind(0), strict=True):
+                projected[lane] = value
+        return torch.stack(projected).flatten(0, 1)
 
     def _apply_ttt_block(self, block, memory, tokens, source, mask, temb, hidden_mask, memory_valid,
                          fast, gate, batch, steps, start_step):

@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import dataclass
 from math import cos, pi
 import os
 from pathlib import Path
@@ -19,7 +20,8 @@ from .gr00t_cache import (
     build_cache, cache_directory, episode_chunks, load_processor, read_cached_segment, read_raw_segment,
 )
 from .gr00t_insert import marvin_statistics
-from .policy import corrupt_actions
+from .policy import RolloutState, corrupt_actions
+from .ttt import FastWeights
 from .raw_data import manifest, scan_episodes
 
 
@@ -31,11 +33,19 @@ def _flow_loss(velocity, target, action_mask, denominator):
     return error.masked_fill(~action_mask, 0).sum() / denominator
 
 
-def train_step(model, optimizer, selections, episodes, cache, args, device, rank, step, *, processor=None):
-    optimizer.zero_grad(set_to_none=True)
+def _trajectory_windows(selections, episodes, stride):
+    windows = []
+    for episode_id, crop_seed, context in selections:
+        episode = episodes[episode_id]
+        chunks = episode_chunks(episode, stride)
+        length = min(chunks, context)
+        first = int(np.random.default_rng(crop_seed).integers(chunks - length + 1))
+        windows.append((episode, first, length))
+    return windows
+
+
+def _serial_backward(model, windows, cache, args, device, rank, step, processor, noise_gen):
     local_loss = torch.zeros((), device=device)
-    lengths = []
-    noise_gen = torch.Generator(device=device).manual_seed(args.seed + step * 8192 + rank)
     if processor is not None:
         # Native post-training enables dropout. Rebuild its rank-local RNG at
         # every optimizer step so resuming reproduces the uninterrupted run.
@@ -43,17 +53,13 @@ def train_step(model, optimizer, selections, episodes, cache, args, device, rank
         torch.random.default_generator.manual_seed(dropout_seed)
         if device.type == "cuda":
             torch.cuda.manual_seed(dropout_seed)
-    for index, (episode_id, crop_seed, context) in enumerate(selections):
-        episode = episodes[episode_id]
-        chunks = episode_chunks(episode, args.stride)
-        length = min(chunks, context)
-        first = int(np.random.default_rng(crop_seed).integers(chunks - length + 1))
-        lengths.append(length)
+    for index, window in enumerate(windows):
+        episode, first, length = window
         carry = None
-        denominator = len(selections) * length * HORIZON * 16
+        denominator = len(windows) * length * HORIZON * 16
         for offset in range(0, length, args.segment):
             stop = min(length, offset + args.segment)
-            sync = index + 1 == len(selections) and stop == length
+            sync = index + 1 == len(windows) and stop == length
             sync_scope = model.no_sync() if isinstance(model, DistributedDataParallel) and not sync else nullcontext()
             if processor is None:
                 batch = read_cached_segment(cache, episode, first + offset, first + stop, device)
@@ -75,6 +81,100 @@ def train_step(model, optimizer, selections, episodes, cache, args, device, rank
                 loss.backward()
             carry = carry.detach()
             local_loss += loss.detach()
+    return local_loss
+
+
+@dataclass
+class _PreparedWindow:
+    tensors: dict
+    length: int
+    vl_width: int
+
+
+def _prepare_windows(windows, cache, device, segment, noise_gen):
+    prepared = []
+    for episode, first, length in windows:
+        batch = read_cached_segment(cache, episode, first, first + length, device)
+        # Keep original generator calls and per-trajectory / per-segment shapes,
+        # including the short tail, before sorting or padding trajectories.
+        noise = [corrupt_actions(chunk, generator=noise_gen) for chunk in batch.pop("actions").split(segment, dim=1)]
+        for name, values in zip(("tau", "noised", "target"), zip(*noise, strict=True), strict=True):
+            batch[name] = torch.cat(values, dim=1)
+        prepared.append(_PreparedWindow(batch, length, batch["features"].shape[2]))
+    return sorted(prepared, key=lambda window: window.length, reverse=True)
+
+
+def _stack_segment(windows, offset, stop):
+    # A repeated last observation supplies well-formed attention masks for time
+    # padding. Padded queries never update TTT or contribute to the loss.
+    width = max(window.vl_width for window in windows)
+    parts = {}
+    for window in windows:
+        end = min(stop, window.length)
+        for name, value in window.tensors.items():
+            row = value[:, offset:end]
+            if end < stop:
+                tail = row[:, -1:].expand(-1, stop - end, *row.shape[2:])
+                row = torch.cat((row, tail), dim=1)
+            if name in ("features", "vl_mask", "image_mask") and window.vl_width < width:
+                padding = (0, 0, 0, width - window.vl_width) if name == "features" else (0, width - window.vl_width)
+                row = torch.nn.functional.pad(row, padding)
+            parts.setdefault(name, []).append(row)
+    return {k: torch.cat(rows, dim=0) for k, rows in parts.items()}
+
+
+def _batched_pretrain_backward(model, windows, cache, args, device, rank, step, noise_gen):
+    prepared = _prepare_windows(windows, cache, device, args.segment, noise_gen)
+    total_loss = torch.zeros((), device=device)
+    width = args.pretrain_micro_batch
+    for begin in range(0, len(prepared), width):
+        group = prepared[begin:begin + width]
+        lengths = torch.tensor([window.length for window in group], device=device)
+        longest = group[0].length
+        carry = None
+        for offset in range(0, longest, args.segment):
+            stop = min(offset + args.segment, longest)
+            # Finished lanes are at the end because crops are sorted by length.
+            remaining = [window for window in group if window.length > offset]
+            size = len(remaining)
+            if size != len(group):
+                group = remaining
+                lengths = lengths[:size]
+                carry = RolloutState(tuple(FastWeights(s.w1[:size], s.b1[:size], s.w2[:size], s.b2[:size])
+                                           for s in carry.fast), carry.index)
+            batch = _stack_segment(group, offset, stop)
+            valid = torch.arange(offset, stop, device=device)[None, :] < lengths[:, None]
+            vl_lengths = tuple(window.vl_width for window in group)
+            sync = begin + width >= len(prepared) and stop == longest
+            scope = model.no_sync() if isinstance(model, DistributedDataParallel) and not sync else nullcontext()
+            with scope:
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    velocity, carry = model(
+                        batch["features"], batch["state"], batch["noised"], batch["tau"], carry, valid,
+                        embodiment_id=batch["embodiment_id"], action_mask=batch["action_mask"],
+                        vl_mask=batch["vl_mask"], image_mask=batch["image_mask"], vl_lengths=vl_lengths,
+                    )
+                    error = (velocity.float() - batch["target"].float()).square()
+                    mask = batch["action_mask"] & valid[:, :, None, None]
+                    sums = error.masked_fill(~mask, 0).sum(dim=(1, 2, 3))
+                    loss = (sums / (len(prepared) * HORIZON * 16 * lengths)).sum()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Nonfinite batched pretraining loss at {step=}, {rank=}, {offset=}")
+                loss.backward()
+            carry = carry.detach()
+            total_loss += loss.detach()
+    return total_loss
+
+
+def train_step(model, optimizer, selections, episodes, cache, args, device, rank, step, *, processor=None):
+    optimizer.zero_grad(set_to_none=True)
+    windows = _trajectory_windows(selections, episodes, args.stride)
+    lengths = [length for _, _, length in windows]
+    noise_gen = torch.Generator(device=device).manual_seed(args.seed + step * 8192 + rank)
+    if getattr(args, "stage", "adapter") == "pretrain" and getattr(args, "pretrain_micro_batch", 1) > 1:
+        local_loss = _batched_pretrain_backward(model, windows, cache, args, device, rank, step, noise_gen)
+    else:
+        local_loss = _serial_backward(model, windows, cache, args, device, rank, step, processor, noise_gen)
     grad = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
     if processor is not None and (args.smoke or step == args.phase_boundary + 1):
         policy = model.module if isinstance(model, DistributedDataParallel) else model
@@ -114,6 +214,8 @@ def _metadata(args, data_sha256, world, stats):
     }
     if args.stage != "adapter":
         metadata.update(model_stage=args.stage, phase_boundary=args.phase_boundary, recipe="paper_two_stage")
+    if args.stage == "pretrain" and getattr(args, "pretrain_micro_batch", 1) > 1:
+        metadata["pretrain_micro_batch"] = args.pretrain_micro_batch
     return metadata
 
 
@@ -125,6 +227,8 @@ def _load_resume(policy, optimizer, path, metadata, stop_at, rank=0):
     saved = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     if any(saved.get(key) != value for key, value in metadata.items() if key != "marvin_statistics"):
         raise ValueError("Resume requires identical base, data, rollout and training settings")
+    if saved.get("pretrain_micro_batch", 1) != metadata.get("pretrain_micro_batch", 1):
+        raise ValueError("Resume requires the original pretraining microbatch")
     completed = int(saved["step"])
     if not 0 <= completed < metadata["settings"]["steps"]:
         raise ValueError(f"Unexpected completed optimizer step {completed}")
@@ -320,6 +424,8 @@ def main():
     parser.add_argument("--stop-after", type=int,
                         help="Save and stop at this absolute optimizer step while preserving the --steps schedule")
     parser.add_argument("--global-batch", type=int, default=64)
+    parser.add_argument("--pretrain-micro-batch", type=int, choices=(1, 2, 4), default=1,
+                        help="Trajectories processed together per rank during TTT-only pretraining")
     parser.add_argument("--ttt-variant", choices=("baseline", "reference"), default="baseline",
                         help="Reference adds pre-QKV RMSNorm and shares each chunk's RoPE position across tokens")
     parser.add_argument("--stride", type=int, default=STRIDE, help="Raw-frame interval between policy windows (native horizon: 40)")

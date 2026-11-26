@@ -50,6 +50,10 @@
 
 设置 `ROBOTTT_RECIPE=paper_two_stage`、`ROBOTTT_TTT_VARIANT=reference`，从官方 NVIDIA 快照重新初始化。DLC 入口为 `bash cloud/run_gr00t_dlc.sh train`。可用 `ROBOTTT_DLC_GPUS=8 ROBOTTT_DLC_NODES=2` 指定两节点各四卡。两种卡数的全局批量均为 64 条轨迹。
 
+预训练可设置 `ROBOTTT_PRETRAIN_MICRO_BATCH=4`，对应附录 A.2 在上下文不超过 4K 时每卡同时训练 4 条轨迹。各轨迹有独立的快权重、时间索引、噪声和损失分母。不同长度的视觉语言输入在原始 token 宽度上做视觉自注意力，再补齐并遮盖以供跨注意力使用。八卡累积两组使全局批量为 64。第二阶段按每卡 1 条进行，八卡累积八次。初始对照作业的预训练每卡一次处理 1 条。
+
+使用 `bash cloud/run_gr00t_dlc.sh benchmark` 可在相同 GPU、基座和缓存上对比预训练每卡 1 条与 4 条。基准在当前课程和课程末期各取四对相同的轨迹、裁剪和噪声，交替两种执行顺序，在预热后计入前向、反传、跨卡归约和优化器更新。结果保存在运行目录中的 `benchmark.json`。
+
 | 优化器步 | 优化范围 | 数据与学习率 |
 | --- | --- | --- |
 | 1–30,000 | 冻结原生视觉语言模型、动作头和 Marvin 投影，仅更新新增的 TTT 参数、register 和门控。 | 复用冻结基座的视觉特征。上下文从 7 块增至 39 块。AdamW，WSD 峰值 `2e-5`，权重衰减 `1e-5`。 |

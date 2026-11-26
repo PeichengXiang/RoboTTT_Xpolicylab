@@ -58,7 +58,7 @@ Set `reset_memory_each_chunk: true` in `deploy.yml` for the same-checkpoint hist
 Train the two-stage native policy through the XPolicyLab entry point on a single eligible four-card host:
 
 ```bash
-ROBOTTT_BACKEND=gr00t_n1_7 ROBOTTT_RECIPE=paper_two_stage ROBOTTT_TTT_VARIANT=reference \
+ROBOTTT_BACKEND=gr00t_n1_7 ROBOTTT_RECIPE=paper_two_stage ROBOTTT_TTT_VARIANT=reference ROBOTTT_PRETRAIN_MICRO_BATCH=4 \
   bash train.sh InsertBenchmark paper50k marvin_dual_gripper joint 1745 0,1,2,3
 ```
 

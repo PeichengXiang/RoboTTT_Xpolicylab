@@ -31,7 +31,8 @@ if [[ -n "${ROBOTTT_RESUME:-}" ]]; then
     resume=(--resume "$ROBOTTT_RESUME")
 fi
 if (( completed < boundary )); then
-    "${launch[@]}" --stage pretrain "${pre_context[@]}" "${resume[@]}"
+    "${launch[@]}" --stage pretrain --pretrain-micro-batch "${ROBOTTT_PRETRAIN_MICRO_BATCH:-1}" \
+        "${pre_context[@]}" "${resume[@]}"
 fi
 if [[ "$mode" == pilot ]]; then exit 0; fi
 if (( completed <= boundary )); then
